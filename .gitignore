@@ -5,3 +5,16 @@
 .httr-oauth
 .DS_Store
 .quarto
+.Rapp.history
+.Rbuildignore
+.Renviron
+.env
+.vscode
+.idea
+*_cache/
+*/_cache/
+reports/cache/
+targets/
+drake/
+_quarto/
+rsconnect/
