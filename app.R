@@ -1,4 +1,3 @@
-
 # ===============================================================================
 # 5. SHINY APP CODE (`app.R`)
 # ===============================================================================
@@ -18,6 +17,13 @@ load("type_eco_data.RData")
 load("species_map.RData")
 load("plot_coordinates.RData")
 load("XData_future_list.RData")
+
+# --- Calculate global climate ranges for consistent map legends ---
+all_mats <- unlist(lapply(XData_future_list, function(df) df$MAT))
+all_maps <- unlist(lapply(XData_future_list, function(df) df$MAP))
+global_mat_range <- range(all_mats, na.rm = TRUE)
+global_map_range <- range(all_maps, na.rm = TRUE)
+
 
 # --- Helper Functions ---
 calculate_csi <- function(community_species, site_suitability_probs, method = "bCSI", weights = NULL) {
@@ -48,21 +54,23 @@ ui <- fluidPage(
       width = 3,
       h4("Global Settings"),
       selectInput("climate_scenario", "1. Select Climate Scenario:", choices = names(all_predictions_summary)),
-      radioButtons("perspective", "2. Choose Analysis Perspective:",
-                   choices = c("Community-Centric" = "community", "Site-Centric" = "site")),
+  selectInput("basemap", "Base Map:",
+      choices = c("CartoDB.Positron", "OpenStreetMap", "Esri.WorldTopoMap", "Esri.WorldGrayCanvas", "Stamen.TonerLite"),
+      selected = "CartoDB.Positron"),
       hr(),
       
+      # Conditional controls based on the selected tab in the main panel
       conditionalPanel(
-        condition = "input.perspective == 'community'",
+        condition = "input.main_tabs == 'Community-Centric'",
         h4("Community-Centric Analysis"),
-        radioButtons("community_method", "3. Define Community:",
-                     choices = c("Select Ecological Type" = "type_eco", "Create Custom Community" = "custom")),
+        radioButtons("community_method", "2. Define Community:",
+                     choices = c("Select Potential Vegetation" = "type_eco", "Create Custom Community" = "custom")),
         conditionalPanel("input.community_method == 'type_eco'",
-                       selectInput("type_eco_choice", "Select Ecological Type:", choices = names(TYPE_ECO_list)),
+                       selectInput("type_eco_choice", "Select Potential Vegetation:", choices = names(TYPE_ECO_list)),
                        wellPanel(style = "background: #f8f9fa;", textOutput("type_eco_desc"))),
         conditionalPanel("input.community_method == 'custom'",
                        selectizeInput("custom_species", "Select Species:", choices = setNames(species_map$code, species_map$pretty_name), multiple = TRUE)),
-        selectInput("csi_metric", "4. Select Suitability Metric:",
+        selectInput("csi_metric", "3. Select Suitability Metric:",
                     choices = c("Basic CSI" = "bCSI", "Weighted CSI" = "wCSI", "Geometric Mean CSI" = "gCSI")),
         uiOutput("species_weights_ui"),
         actionButton("run_community_analysis", "Calculate Suitability", icon = icon("cogs"), class = "btn-primary"),
@@ -70,25 +78,24 @@ ui <- fluidPage(
       ),
       
       conditionalPanel(
-        condition = "input.perspective == 'site'",
+        condition = "input.main_tabs == 'Site-Centric'",
         h4("Site-Centric Analysis"),
-        selectizeInput("plot_choice", "3. Select a Plot ID:", choices = NULL, options = list(placeholder = 'Select a plot...')),
+        selectizeInput("plot_choice", "2. Select a Plot ID:", choices = NULL, options = list(placeholder = 'Select a plot...')),
         leafletOutput("site_location_map", height = "200px")
       )
     ),
     
     mainPanel(
       width = 9,
-      tabsetPanel(
-        tabPanel("Main Analysis",
-                 conditionalPanel("input.perspective == 'community'",
-                                h3(textOutput("community_output_title")),
-                                leafletOutput("csi_map", height = "600px"),
-                                DT::dataTableOutput("csi_table")),
-                 conditionalPanel("input.perspective == 'site'",
-                                h3(textOutput("site_output_title")),
-                                plotOutput("predicted_composition_plot"))
-        ),
+      tabsetPanel(id = "main_tabs",
+        tabPanel("Community-Centric",
+                 h3(textOutput("community_output_title")),
+                 leafletOutput("csi_map", height = "600px"),
+                 downloadButton("download_csv", "Download CSV"),
+                 DT::dataTableOutput("csi_table")),
+        tabPanel("Site-Centric",
+                 h3(textOutput("site_output_title")),
+                 plotOutput("predicted_composition_plot")),
         tabPanel("Climate Maps",
                  h4("Climate Variables for Selected Scenario"),
                  fluidRow(
@@ -116,12 +123,12 @@ ui <- fluidPage(
                    tags$li(tags$strong("Select a Climate Scenario:"), "Choose from current conditions or future projections (e.g., different GCMs like 'SSP3 7.0 - 2041_2070'). This affects all predictions."),
                    tags$li(tags$strong("Choose an Analysis Perspective:"), 
                       tags$ul(
-                        tags$li(tags$strong("Community-Centric:"), "Focus on how well a whole community (e.g., an ecological type) fits a site. Define the community, select a metric, and view suitability maps."),
+                        tags$li(tags$strong("Community-Centric:"), "Focus on how well a whole community (e.g., a potential vegetation type) fits a site. Define the community, select a metric, and view suitability maps."),
                         tags$li(tags$strong("Site-Centric:"), "Focus on a specific plot. See predicted species composition and run 'what-if' scenarios.")
                       )),
                    tags$li(tags$strong("For Community-Centric:"),
                       tags$ul(
-                        tags$li("Define the community: Select an ecological type (pre-defined species lists) or create a custom one by picking species."),
+                        tags$li("Define the community: Select a potential vegetation type (pre-defined species lists) or create a custom one by picking species."),
                         tags$li("Choose a Suitability Metric: See explanations below."),
                         tags$li("Optionally, add weights for species importance."),
                         tags$li("Click 'Calculate Suitability' to generate maps and tables.")
@@ -160,29 +167,38 @@ ui <- fluidPage(
                  p("This app uses the Hierarchical Model of Species Communities (Hmsc) for joint species distribution modeling, as described in:"),
                  p(tags$em("Tikhonov, G., Opedal, Ø.H., Abrego, N., Lehikoinen, A., de Jonge, M.M.J., Oksanen, J., Ovaskainen, O., 2020. Joint species distribution modelling with the r-package Hmsc. Methods in Ecology and Evolution 11, 442–447. https://doi.org/10.1111/2041-210X.13345")),
                  p("The simulations and modeling are based on permanent inventory sampled plots filtered for no human disturbances from the 4th campaign of the Quebec forest inventory. The variables as environmental predictors used in the modelling process were  Mean Annual Precipitation , Mean Annual Temperature, Organic Matter , Slope, and Drainage."),
-                 p("Results for default communities (ecological types) account for interactions among tree species through the joint modeling approach. However, when designing a custom community, the CSI index is calculated from the predicted probabilities of the selected species for a given plot, without iteratively considering interactions in the model predictions."),
-                 p("The HMSC Bayesian model was fitted with the following settings: Posterior MCMC sampling with 4 chains each with 4,000 samples, thin 100 and transient 200,000."),
-                 p("Model summary: Hmsc object with 5572 sampling units, 9 species, 6 covariates, 1 traits and 1 random levels."),
+                 p("Results for default communities (potential vegetation types) account for interactions among tree species through the joint modeling approach. However, when designing a custom community, the CSI index is calculated from the predicted probabilities of the selected species for a given plot, without iteratively considering interactions in the model predictions."),
+                 p("The HMSC Bayesian model was fitted with the following settings: Posterior MCMC sampling with 4 chains each with 1,000 samples, thin 100 and transient 50,000."),
+                 p("Model summary: Hmsc object with 5572 sampling units, 13 species, 26 covariates, 1 traits and 1 random levels."),
                  p("Convergence diagnostics: Percentage of parameters with Effective Sample Size (ESS) >= 1000 and Potential Scale Reduction Factor (PSRF) <= 1.1: 96.3%."),
-                 h5("Explanatory Power (Tjur R²) and Prevalence for Species"),
+                 h5("Explanatory Power (Tjur R²), AUC, RMSE and Prevalence per species"),
                  tags$table(
                    tags$thead(
-                     tags$tr(
-                       tags$th("Explanatory Tjur R²"),
-                       tags$th("Species"),
-                       tags$th("Prevalence")
-                     )
+                   tags$tr(
+                     tags$th("Pretty name"),
+                     tags$th("Quebec Inventory Standard Code"),
+                     tags$th("French name"),
+                     tags$th("Scientific name"),
+                     tags$th("Prevalence"),
+                     tags$th("AUC"),
+                     tags$th("RMSE"),
+                     tags$th("Tjur R²")
+                   )
                    ),
                    tags$tbody(
-                     tags$tr(tags$td("0.6374830"), tags$td("Ace.sac"), tags$td("745")),
-                     tags$tr(tags$td("0.5706250"), tags$td("Abi.bal"), tags$td("3740")),
-                     tags$tr(tags$td("0.5234011"), tags$td("Pic.mar"), tags$td("3229")),
-                     tags$tr(tags$td("0.4339156"), tags$td("Bet.pap"), tags$td("2773")),
-                     tags$tr(tags$td("0.4288925"), tags$td("Pic.gla"), tags$td("1984")),
-                     tags$tr(tags$td("0.4246715"), tags$td("Ace.rub"), tags$td("1304")),
-                     tags$tr(tags$td("0.4236835"), tags$td("Bet.all"), tags$td("917")),
-                     tags$tr(tags$td("0.4107877"), tags$td("Pin.ban"), tags$td("688")),
-                     tags$tr(tags$td("0.1609335"), tags$td("Pop.tre"), tags$td("1034"))
+                   tags$tr(tags$td("Ace.rubr"), tags$td("ERR"), tags$td("Érable rouge"), tags$td("Acer rubrum"), tags$td("1304"), tags$td("0.92"), tags$td("0.31"), tags$td("0.43")),
+                   tags$tr(tags$td("Ace.sacc"), tags$td("ERS"), tags$td("Érable à sucre"), tags$td("Acer saccharum"), tags$td("745"), tags$td("0.99"), tags$td("0.19"), tags$td("0.62")),
+                   tags$tr(tags$td("Bet.alle"), tags$td("BOJ"), tags$td("Bouleau jaune"), tags$td("Betula alleghaniensis"), tags$td("917"), tags$td("0.99"), tags$td("0.22"), tags$td("0.52")),
+                   tags$tr(tags$td("Bet.papy"), tags$td("BOP"), tags$td("Bouleau à papier (blanc)"), tags$td("Betula papyrifera"), tags$td("2773"), tags$td("0.93"), tags$td("0.34"), tags$td("0.44")),
+                   tags$tr(tags$td("Pic.glau"), tags$td("EPB"), tags$td("Épinette blanche"), tags$td("Picea glauca"), tags$td("1984"), tags$td("0.94"), tags$td("0.33"), tags$td("0.43")),
+                   tags$tr(tags$td("Abi.bals"), tags$td("SAB"), tags$td("Sapin baumier"), tags$td("Abies balsamea"), tags$td("3740"), tags$td("0.98"), tags$td("0.25"), tags$td("0.59")),
+                   tags$tr(tags$td("Pic.mari"), tags$td("EPN"), tags$td("Épinette noire"), tags$td("Picea mariana"), tags$td("3229"), tags$td("0.96"), tags$td("0.29"), tags$td("0.55")),
+                   tags$tr(tags$td("Thu.occi"), tags$td("THO"), tags$td("Thuya occidental"), tags$td("Thuja occidentalis"), tags$td("540"), tags$td("0.92"), tags$td("0.25"), tags$td("0.25")),
+                   tags$tr(tags$td("Pru.pens"), tags$td("PRP"), tags$td("Cerisier de Pennsylvanie"), tags$td("Prunus pensylvanica"), tags$td("350"), tags$td("0.83"), tags$td("0.23"), tags$td("0.08")),
+                   tags$tr(tags$td("Pop.trem"), tags$td("PET"), tags$td("Peuplier faux-tremble"), tags$td("Populus tremuloides"), tags$td("1034"), tags$td("0.83"), tags$td("0.34"), tags$td("0.18")),
+                   tags$tr(tags$td("Pin.stro"), tags$td("PIB"), tags$td("Pin blanc"), tags$td("Pinus strobus"), tags$td("330"), tags$td("0.93"), tags$td("0.20"), tags$td("0.24")),
+                   tags$tr(tags$td("Lar.lari"), tags$td("MEL"), tags$td("Mélèze laricin"), tags$td("Larix laricina"), tags$td("241"), tags$td("0.90"), tags$td("0.19"), tags$td("0.13")),
+                   tags$tr(tags$td("Pin.bank"), tags$td("PIG"), tags$td("Pin gris"), tags$td("Pinus banksiana"), tags$td("688"), tags$td("0.96"), tags$td("0.23"), tags$td("0.41"))
                    )
                  ),
                  p("Enjoy exploring climate adaptation strategies with CAMS!")
@@ -194,62 +210,45 @@ ui <- fluidPage(
 
 # --- SERVER ---
 server <- function(input, output, session) {
-  
+
   # Update plot_choice with server-side selectize for performance
   updateSelectizeInput(session, "plot_choice", choices = plots_for_map$plot_id, server = TRUE)
-  
-  # Reactive for selected plots on map
-  selected_plots <- reactiveVal(character(0))
-  
-  # Reactive to toggle raster view
-  show_raster <- reactiveVal(FALSE)
-  
-  # Observe marker clicks to toggle selection
-  observeEvent(input$csi_map_marker_click, {
-    clicked <- input$csi_map_marker_click$id
-    current <- selected_plots()
-    if (clicked %in% current) {
-      selected_plots(setdiff(current, clicked))
-    } else {
-      selected_plots(c(current, clicked))
-    }
-  })
-  
-  # Clear selection
-  observeEvent(input$clear_selection, {
-    selected_plots(character(0))
-  })
-  
-  observeEvent(input$toggle_raster, {
-    show_raster(!show_raster())
-  })
-  
+
   # --- Reactive Data ---
-  preds_summary <- reactive(all_predictions_summary[[input$climate_scenario]])
-  
+  preds_summary <- reactive({
+    all_predictions_summary[[input$climate_scenario]]
+  })
+
+  current_climate_data <- reactive({
+    XData_future_list[[input$climate_scenario]] %>%
+      as_tibble(rownames = "plot_id") %>%
+      left_join(plots_for_map, by = "plot_id")
+  })
+
   # --- Community-Centric Logic ---
   target_community_species <- reactive({
     if (input$community_method == "type_eco") {
       TYPE_ECO_list[[input$type_eco_choice]]
     } else {
-      # Map selected codes to original_name_in_data
       species_map$original_name_in_data[match(input$custom_species, species_map$code)]
     }
   })
-  
-  output$type_eco_desc <- renderText(type_eco_descriptions$Description[type_eco_descriptions$type_eco_prefix == str_sub(input$type_eco_choice, 1, 3)])
-  
+
+  output$type_eco_desc <- renderText(
+    type_eco_descriptions$Description[type_eco_descriptions$type_eco_prefix == str_sub(input$type_eco_choice, 1, 3)]
+  )
+
   output$species_weights_ui <- renderUI({
     req(input$csi_metric == "wCSI")
     species <- target_community_species()
     map(species, ~ numericInput(paste0("weight_", .x), label = species_map$pretty_name[species_map$original_name_in_data == .x], value = 1, min = 0, max = 100))
   })
-  
-  csi_results <- reactive({
+
+  csi_results <- eventReactive(input$run_community_analysis, {
     community_spp <- target_community_species()
     req(length(community_spp) > 0)
     pred_df <- preds_summary()$mean
-    
+
     user_weights <- NULL
     if (input$csi_metric == "wCSI") {
       user_weights <- setNames(vapply(community_spp, function(x) {
@@ -257,111 +256,119 @@ server <- function(input, output, session) {
         if (is.null(val)) 1 else val
       }, numeric(1)), community_spp)
     }
-    
-    # Calculate CSI for mean, lower, and upper predictions
+
     mean_csi <- apply(pred_df, 1, function(p) calculate_csi(community_spp, p, input$csi_metric, user_weights))
     lower_csi <- apply(preds_summary()$lower, 1, function(p) calculate_csi(community_spp, p, input$csi_metric, user_weights))
     upper_csi <- apply(preds_summary()$upper, 1, function(p) calculate_csi(community_spp, p, input$csi_metric, user_weights))
-    
+
     tibble(plot_id = rownames(pred_df), mean = mean_csi, lower = lower_csi, upper = upper_csi) %>%
       mutate(ci_width = upper - lower) %>%
       left_join(plots_for_map, by = "plot_id") %>%
-      left_join(current_climate_data() %>% select(plot_id, MAT, MAP, OM, slope, drainage_class), by = "plot_id")
+      left_join(current_climate_data() %>% select(plot_id, MAP, MAT, pH, Clay, OM, rtp, twi, slope, drainage_class), by = "plot_id")
   })
-  
+
   output$community_output_title <- renderText(paste("Community Suitability for:", input$climate_scenario))
-  
+
   output$csi_map <- renderLeaflet({
+    req(csi_results())
     df <- csi_results()
-    if (is.null(df) || nrow(df) == 0) {
-      return(leaflet() %>% addProviderTiles(providers$CartoDB.Positron) %>% addControl("No data available. Please select a community and click 'Calculate Suitability'.", position = "topright"))
-    }
-    selected <- selected_plots()
-    
     pal <- colorNumeric(palette = "viridis", domain = df$mean, na.color = "transparent")
-    map <- leaflet(df) %>% addProviderTiles(providers$CartoDB.Positron)
-    
-    # All markers
-    map <- map %>% addCircleMarkers(lng = ~longitude, lat = ~latitude, color = ~pal(mean),
+    leaflet(df) %>%
+      addProviderTiles(providers[[input$basemap]]) %>%
+      addCircleMarkers(lng = ~longitude, lat = ~latitude, color = ~pal(mean),
                        radius = 5, stroke = FALSE, fillOpacity = 0.8,
                        layerId = ~plot_id,
-                       popup = ~paste("Plot:", plot_id, "<br>Mean CSI:", round(mean, 3)))
-    
-    # Highlight selected
-    if (length(selected) > 0) {
-      selected_df <- df %>% filter(plot_id %in% selected)
-      map <- map %>% addCircleMarkers(data = selected_df, lng = ~longitude, lat = ~latitude, 
-                         color = "red", radius = 5, stroke = TRUE, weight = 2,
-                         fillOpacity = 0.8, layerId = ~plot_id,
-                         popup = ~paste("Plot:", plot_id, "<br>Mean CSI:", round(mean, 3), "<br>(Selected)"))
-    }
-    
-    map %>% addLegend("bottomright", pal = pal, values = df$mean, title = "Mean CSI")
+                       popup = ~paste("Plot:", plot_id, "<br>Mean CSI:", round(mean, 3))) %>%
+      addLegend("bottomright", pal = pal, values = ~mean, title = "Mean CSI")
   })
-  
+
   output$csi_table <- DT::renderDataTable({
-    table_data <- csi_results()
-    if (length(selected_plots()) > 0) {
-      table_data <- table_data %>% filter(plot_id %in% selected_plots())
-    }
-    table_data %>% select(plot_id, latitude, longitude, MAT, MAP, OM, slope, drainage_class, mean, lower, upper, ci_width) %>% arrange(desc(mean)) %>%
+    req(csi_results())
+    csi_results() %>%
+      select(plot_id, latitude, longitude, MAP, MAT, pH, Clay, OM, rtp, twi, slope, drainage_class, mean, lower, upper, ci_width) %>%
+      arrange(desc(mean)) %>%
       mutate(across(where(is.numeric), ~round(., 3))) %>%
       DT::datatable(options = list(pageLength = 5), rownames = FALSE)
   })
-  
+
+  # Download handler for CSV
+  output$download_csv <- downloadHandler(
+    filename = function() {
+      paste("csi_results_", input$climate_scenario, "_", Sys.Date(), ".csv", sep = "")
+    },
+    content = function(file) {
+      write.csv(csi_results(), file, row.names = FALSE)
+    }
+  )
+
   # --- Site-Centric Logic ---
-  selected_plot_preds <- reactive(preds_summary()$mean[input$plot_choice, ])
-  
+  selected_plot_preds <- reactive({
+    req(input$plot_choice, input$climate_scenario, cancelOutput = TRUE)
+    preds <- all_predictions_summary[[input$climate_scenario]]$mean
+    message("Selected plot_id: ", input$plot_choice)
+    message("Available plot_ids in preds: ", paste(head(rownames(preds)), collapse = ", "))
+    if (!(input$plot_choice %in% rownames(preds))) {
+      message("Error: plot_id not found in predictions")
+      return(NULL)
+    }
+    selected <- preds[input$plot_choice, , drop = FALSE]
+    message("Selected predictions: ", paste(selected, collapse = ", "))
+    selected
+  })
+
   output$site_location_map <- renderLeaflet({
+    req(input$plot_choice)
     plot_info <- plots_for_map %>% filter(plot_id == input$plot_choice)
-    leaflet() %>% addProviderTiles(providers$CartoDB.Positron) %>%
+    leaflet() %>% addProviderTiles(providers[[input$basemap]]) %>%
       addMarkers(lng = plot_info$longitude, lat = plot_info$latitude) %>%
       setView(lng = plot_info$longitude, lat = plot_info$latitude, zoom = 10)
   })
-  
-  output$site_output_title <- renderText(paste("Predicted Community for Plot:", input$plot_choice, "under", input$climate_scenario))
-  
+
+  output$site_output_title <- renderText({
+    req(input$plot_choice)
+    paste("Predicted Community for Plot:", input$plot_choice, "under", input$climate_scenario)
+  })
+
   output$predicted_composition_plot <- renderPlot({
-    plot_data <- selected_plot_preds() %>%
+    preds <- selected_plot_preds()
+    req(nrow(preds) > 0)
+
+    plot_data <- as.data.frame(preds) %>%
       pivot_longer(everything(), names_to = "original_name_in_data", values_to = "prob") %>%
       left_join(species_map, by = "original_name_in_data") %>%
-      arrange(desc(prob)) %>% head(20)
+      filter(!is.na(prob)) %>%
+      arrange(desc(prob)) %>%
+      head(20)
+
     ggplot(plot_data, aes(x = reorder(pretty_name, prob), y = prob)) +
-      geom_col(fill = "steelblue") + coord_flip() +
+      geom_col(fill = "steelblue") +
+      coord_flip() +
       labs(x = "Species", y = "Probability of Occurrence", title = "Top 20 Most Probable Species") +
       theme_minimal(base_size = 14)
   })
-  
+
   # --- Climate Maps Tab ---
-  current_climate_data <- reactive({
-    XData_future_list[[input$climate_scenario]] %>%
-      as_tibble(rownames = "plot_id") %>%
-      left_join(plots_for_map, by = "plot_id")
-  })
-  
   output$map_mat <- renderLeaflet({
     df <- current_climate_data()
-    if (is.null(df) || nrow(df) == 0) return(leaflet() %>% addProviderTiles(providers$CartoDB.Positron))
-    
-    pal <- colorNumeric(palette = "viridis", domain = df$MAT, na.color = "transparent")
-    map <- leaflet(df) %>% addProviderTiles(providers$CartoDB.Positron) %>%
+    req(nrow(df) > 0)
+    pal <- colorNumeric(palette = "viridis", domain = global_mat_range, na.color = "transparent")
+    leaflet(df) %>% addProviderTiles(providers[[input$basemap]]) %>%
       addCircleMarkers(lng = ~longitude, lat = ~latitude, color = ~pal(MAT),
                        radius = 5, stroke = FALSE, fillOpacity = 0.8,
                        popup = ~paste("Plot:", plot_id, "<br>MAT:", round(MAT, 1), "°C")) %>%
-      addLegend("bottomright", pal = pal, values = df$MAT, title = "MAT (°C)")
+      addLegend("bottomright", pal = pal, values = ~MAT, title = "MAT (°C)")
   })
-  
+
   output$map_map <- renderLeaflet({
     df <- current_climate_data()
-    if (is.null(df) || nrow(df) == 0) return(leaflet() %>% addProviderTiles(providers$CartoDB.Positron))
-    
-    pal <- colorNumeric(palette = "magma", domain = df$MAP, na.color = "transparent")
-    map <- leaflet(df) %>% addProviderTiles(providers$CartoDB.Positron) %>%
+    req(nrow(df) > 0)
+    pal <- colorNumeric(palette = "magma", domain = global_map_range, na.color = "transparent")
+    leaflet(df) %>% addProviderTiles(providers[[input$basemap]]) %>%
       addCircleMarkers(lng = ~longitude, lat = ~latitude, color = ~pal(MAP),
                        radius = 5, stroke = FALSE, fillOpacity = 0.8,
                        popup = ~paste("Plot:", plot_id, "<br>MAP:", round(MAP, 0), "mm")) %>%
-      addLegend("bottomright", pal = pal, values = df$MAP, title = "MAP (mm)")
-  })  
+      addLegend("bottomright", pal = pal, values = ~MAP, title = "MAP (mm)")
+  })
 }
 
 # --- Run the App ---
