@@ -4,6 +4,8 @@
 # This code should be saved as a separate file named `app.R` inside the `shiny_app_dir` directory.
 
 # --- Start of app.R ---
+
+
 library(shiny)
 library(shinythemes)
 library(tidyverse)
@@ -11,18 +13,388 @@ library(leaflet)
 library(DT)
 library(sf)
 
+## Simplified single-folder deployment: all data and draw files reside with app.R
+## Set base path to current working directory. Place app.R and all *.RData / *_preds_subsampled.Rda together.
+path <- "."
+message("[TCAMS] Single-folder mode. Data path set to ", normalizePath(path, winslash="/", mustWork = FALSE))
+
 # --- Load pre-processed data ---
-load("all_predictions_summary.RData")
-load("type_eco_data.RData")
-load("species_map.RData")
-load("plot_coordinates.RData")
-load("XData_future_list.RData")
+load(file.path(path, "all_predictions_summary.RData"))
+load(file.path(path, "type_eco_data.RData"))
+load(file.path(path, "species_map.RData"))
+load(file.path(path, "plot_coordinates.RData"))
+load(file.path(path, "XData_future_list.RData"))
+
+# Harmonise plot coordinate object naming and structure
+if (!exists("plots_for_map")) {
+  if (exists("plot_coordinates")) {
+    plots_for_map <- plot_coordinates
+  } else {
+    warning("'plot_coordinates.RData' did not contain an object named 'plots_for_map'. Building placeholder coordinates with NA longitude/latitude; please provide plot_coordinates with 5572 rows.")
+    first_pred <- all_predictions_summary[[1]]$mean
+    fallback_ids <- rownames(first_pred)
+    plots_for_map <- tibble(
+      plot_id = fallback_ids,
+      longitude = NA_real_,
+      latitude = NA_real_
+    )
+  }
+}
+
+required_coord_cols <- c("plot_id", "longitude", "latitude")
+missing_coord_cols <- setdiff(required_coord_cols, colnames(plots_for_map))
+if (length(missing_coord_cols)) {
+  for (mc in missing_coord_cols) {
+    plots_for_map[[mc]] <- NA_real_
+  }
+}
+plots_for_map <- plots_for_map %>%
+  mutate(plot_id = as.character(plot_id)) %>%
+  select(any_of(required_coord_cols))
+plot_coordinates <- plots_for_map
+
+# Use comprehensive `type_eco_descriptions` loaded from RData if available; otherwise minimal fallback.
+if (!exists("type_eco_descriptions") || !is.data.frame(type_eco_descriptions) ||
+    !all(c("type_eco_prefix","Description") %in% names(type_eco_descriptions))) {
+  type_eco_descriptions <- data.frame(
+    type_eco_prefix = c("ERS", "BOJ", "BOP", "EPB", "SAB", "EPN", "THO", "PRP", "PET", "PIB", "MEL", "PIG"),
+    Description = c(
+      "Érable à sucre (Sugar Maple)",
+      "Bouleau jaune (Yellow Birch)",
+      "Bouleau à papier (Paper Birch)",
+      "Épinette blanche (White Spruce)",
+      "Sapin baumier (Balsam Fir)",
+      "Épinette noire (Black Spruce)",
+      "Thuya occidental (Eastern White Cedar)",
+      "Cerisier de Pennsylvanie (Pin Cherry)",
+      "Peuplier faux-tremble (Trembling Aspen)",
+      "Pin blanc (Eastern White Pine)",
+      "Mélèze laricin (Tamarack)",
+      "Pin gris (Jack Pine)"
+    )
+  )
+  message("Fallback type_eco_descriptions created (comprehensive file not found or malformed)")
+} else {
+  message("Loaded type_eco_descriptions with ", nrow(type_eco_descriptions), " rows")
+}
+
+# Longest-prefix description lookup (e.g. FC10A -> FC10 -> FC1 if only FC1 exists)
+find_type_eco_description <- function(code) {
+  prefixes <- type_eco_descriptions$type_eco_prefix
+  if (is.null(prefixes) || !length(prefixes)) return(NA_character_)
+  matches <- prefixes[startsWith(code, prefixes)]
+  if (!length(matches)) return(NA_character_)
+  pref <- matches[which.max(nchar(matches))]
+  desc <- type_eco_descriptions$Description[type_eco_descriptions$type_eco_prefix == pref]
+  if (length(desc)) desc[[1]] else NA_character_
+}
+
+# Build labelled choices for potential vegetation (code - description)
+community_choices <- {
+  if (exists("TYPE_ECO_list") && length(TYPE_ECO_list)) {
+    codes <- sort(unique(names(TYPE_ECO_list)))
+    labels <- vapply(codes, function(k) {
+      d <- find_type_eco_description(k)
+      if (is.na(d) || !nzchar(d)) {
+        # Build fallback description from first 3 species pretty names
+        spp <- TYPE_ECO_list[[k]]
+        spp_pretty <- species_map$pretty_name[match(spp, species_map$original_name_in_data)]
+        spp_pretty <- spp_pretty[!is.na(spp_pretty)]
+        if (length(spp_pretty)) {
+          d <- paste("Community:", paste(head(spp_pretty, 3), collapse=", "))
+        } else {
+          d <- "Community definition unavailable"
+        }
+      }
+      paste(k, "-", d)
+    }, character(1))
+    setNames(codes, labels)
+  } else {
+    character(0)
+  }
+}
+message("community_choices built: ", length(community_choices), " entries")
+if (length(community_choices)) message("Example labels: ", paste(head(names(community_choices), 10), collapse = "; "))
+
+# Standardize covariate order across all XData entries
+covariate_order <- c("pH", "Clay", "OM", "rtp", "twi", "slope", "drainage_class", "MAT", "MAP")
+if (exists("XData_future_list") && length(XData_future_list)) {
+  reference_levels <- list()
+  exemplar <- XData_future_list[[1]]
+  factor_cols <- names(Filter(is.factor, as.data.frame(exemplar)))
+  if (length(factor_cols)) {
+    reference_levels <- lapply(factor_cols, function(fc) levels(exemplar[[fc]]))
+    names(reference_levels) <- factor_cols
+  }
+  XData_future_list <- lapply(XData_future_list, function(df) {
+    df <- as.data.frame(df)
+    for (fc in names(reference_levels)) {
+      if (fc %in% colnames(df)) {
+        df[[fc]] <- factor(df[[fc]], levels = reference_levels[[fc]])
+      }
+    }
+    desired_order <- if (all(covariate_order %in% colnames(df))) covariate_order else colnames(df)
+    missing_preds <- setdiff(desired_order, colnames(df))
+    if (length(missing_preds)) {
+      stop("Predictor(s) missing in XData entry: ", paste(missing_preds, collapse = ", "))
+    }
+    df[, desired_order, drop = FALSE]
+  })
+}
+
+# str(all_predictions_summary)
+# str(TYPE_ECO_list)
+# str(species_map)
+# str(plot_coordinates)
+# str(XData_future_list)
+
 
 # --- Calculate global climate ranges for consistent map legends ---
 all_mats <- unlist(lapply(XData_future_list, function(df) df$MAT))
 all_maps <- unlist(lapply(XData_future_list, function(df) df$MAP))
 global_mat_range <- range(all_mats, na.rm = TRUE)
 global_map_range <- range(all_maps, na.rm = TRUE)
+
+# --- Uncertainty parameters and draw file map ---
+epsilon <- 1e-4
+hdi_prob <- 0.89
+draws_dir <- path  # draws live directly beside app.R
+draw_files <- list.files(draws_dir, pattern = "_preds_subsampled\\.Rda$", full.names = TRUE)
+message("[TCAMS] Draw files detected: ", length(draw_files))
+if (length(draw_files)) message("[TCAMS] Example draw files: ", paste(head(basename(draw_files), 8), collapse = "; "))
+
+sanitize_key <- function(x) {
+  x %>%
+    str_to_lower() %>%
+    str_replace_all("[^a-z0-9]", "")
+}
+
+# Build scenario map for posterior draw files
+scenario_map <- {
+  base_map <- tibble(label = names(all_predictions_summary))
+  if (!length(draw_files)) return(base_map %>% mutate(file_path = NA_character_))
+
+  available_files <- tibble(file_path = draw_files) %>%
+    mutate(base_name = basename(file_path),
+           sans_ext = tools::file_path_sans_ext(base_name),
+           # Primary candidate: remove the suffix; also remove optional .gcm
+           label_candidate = str_remove(sans_ext, "_preds_subsampled$") %>% str_remove("\\.gcm$"),
+           label_key = sanitize_key(label_candidate)) %>%
+    filter(!is.na(label_key) & label_key != "") %>%
+    distinct(label_key, .keep_all = TRUE)
+
+  # Scenario keys (try both original and with .gcm removed if present)
+  scenario_tbl <- base_map %>%
+    mutate(label_key = sanitize_key(label),
+           label_key_alt = sanitize_key(str_remove(label, "\\.gcm$")))
+
+  # Initial exact join on label_key or alternate key
+  mapped_primary <- scenario_tbl %>%
+    left_join(available_files %>% select(label_key, file_path), by = "label_key")
+  # Fill NAs using alt key
+  mapped_primary <- mapped_primary %>%
+    mutate(file_path = ifelse(is.na(file_path), available_files$file_path[match(label_key_alt, available_files$label_key)], file_path))
+
+  # Fuzzy match remaining NA by prefix containment
+  remaining <- mapped_primary %>% filter(is.na(file_path))
+  if (nrow(remaining)) {
+    af <- available_files
+    for (i in seq_len(nrow(remaining))) {
+      skey <- remaining$label_key[i]
+      # Candidates where either available starts with scenario key or vice-versa
+      cand <- af %>% filter(str_starts(label_key, skey) | str_starts(skey, label_key))
+      if (nrow(cand) == 1) {
+        mapped_primary$file_path[mapped_primary$label_key == skey] <- cand$file_path[1]
+      }
+    }
+  }
+
+  mapped <- mapped_primary %>% transmute(label, file_path)
+  message("[TCAMS] Scenario draws mapped (exact+fuzzy): ", sum(!is.na(mapped$file_path)), "/", nrow(mapped))
+  # Debug examples
+  if (sum(!is.na(mapped$file_path))) {
+    ex_present <- mapped %>% filter(!is.na(file_path)) %>% head(6)
+    message("[TCAMS] Examples with draws: ", paste(ex_present$label, collapse = "; "))
+  }
+  ex_missing <- mapped %>% filter(is.na(file_path)) %>% head(6)
+  if (nrow(ex_missing)) message("[TCAMS] Examples without draws: ", paste(ex_missing$label, collapse = "; "))
+  mapped
+}
+
+# --- Helper Functions ---
+# Compute HDI using sorted samples; fallback to quantiles on failure
+safe_hdi <- function(x, prob = hdi_prob) {
+  vals <- sort(x[is.finite(x)])
+  n <- length(vals)
+  if (!n) return(c(lower = NA_real_, upper = NA_real_))
+  if (prob <= 0 || prob >= 1) return(c(lower = min(vals), upper = max(vals)))
+  eq_probs <- c((1 - prob) / 2, 1 - (1 - prob) / 2)
+  eq <- as.numeric(quantile(vals, probs = eq_probs, names = FALSE, type = 7))
+  window <- max(floor(prob * n), 1)
+  if (window >= n) return(c(lower = eq[1], upper = eq[2]))
+  widths <- vals[(window + 1):n] - vals[1:(n - window)]
+  if (!length(widths)) return(c(lower = eq[1], upper = eq[2]))
+  idx <- which.min(widths)
+  if (!length(idx) || is.na(idx)) {
+    return(c(lower = eq[1], upper = eq[2]))
+  }
+  c(lower = vals[idx], upper = vals[idx + window])
+}
+
+# test posterior summarisation with a scenario
+
+
+# Summarise posterior samples with center, HDI, and quantiles
+summarise_posterior <- function(x, prob = hdi_prob, central = c("median", "mean")) {
+  vals <- x[is.finite(x)]
+  central <- match.arg(central)
+  if (!length(vals)) {
+    return(tibble(center = NA_real_, mean = NA_real_, sd = NA_real_, hdi_lower = NA_real_, hdi_upper = NA_real_, q025 = NA_real_, q975 = NA_real_))
+  }
+  hdi <- safe_hdi(vals, prob)
+  qs <- quantile(vals, probs = c(0.025, 0.975), na.rm = TRUE, names = FALSE)
+  tibble(
+    center = if (central == "median") median(vals) else mean(vals),
+    mean = mean(vals),
+    sd = sd(vals),
+    hdi_lower = hdi[["lower"]],
+    hdi_upper = hdi[["upper"]],
+    q025 = qs[[1]],
+    q975 = qs[[2]]
+  )
+}
+
+# Compute CSI per draw and site for requested metric
+compute_csi_per_draw_site <- function(draws, species_vec, metric = c("bCSI", "wCSI", "gCSI"), weights = NULL, eps = epsilon, progress_fun = NULL) {
+  metric <- match.arg(metric)
+  draw_dimnames <- dimnames(draws)
+  available_spp <- draw_dimnames[[3]]
+  keep <- intersect(species_vec, available_spp)
+  if (!length(keep)) return(tibble())
+
+  weight_lookup <- if (is.null(weights)) setNames(rep(1, length(keep)), keep) else weights[keep]
+  weight_lookup[is.na(weight_lookup)] <- 0
+
+  n_draws <- dim(draws)[1]
+  site_ids <- draw_dimnames[[2]]
+
+  res <- map_dfr(seq_len(n_draws), function(d) {
+    if (!is.null(progress_fun)) {
+      tryCatch(progress_fun(d, n_draws), error = function(e) NULL)
+    }
+    mat <- draws[d, site_ids, keep, drop = FALSE]
+    mat <- matrix(mat, nrow = length(site_ids), ncol = length(keep),
+                  dimnames = list(site = site_ids, species = keep))
+    map_dfr(site_ids, function(site_id) {
+      site_slice <- mat[site_id, , drop = FALSE]
+      probs <- as.numeric(site_slice)
+      names(probs) <- colnames(site_slice)
+      valid <- !is.na(probs)
+      if (!any(valid)) return(NULL)
+      probs_use <- probs[valid]
+      weights_use <- weight_lookup[names(probs_use)]
+      if (all(weights_use == 0) || all(is.na(weights_use))) {
+        weights_use <- rep(1, length(probs_use))
+      }
+      weights_use[is.na(weights_use)] <- 0
+      if (sum(weights_use) <= 0) {
+        weights_use <- rep(1 / length(probs_use), length(probs_use))
+      } else {
+        weights_use <- weights_use / sum(weights_use)
+      }
+
+      if (metric == "bCSI") {
+        tibble(site = site_id, value = mean(probs_use))
+      } else if (metric == "wCSI") {
+        tibble(site = site_id, value = sum(probs_use * weights_use))
+      } else {
+        log_probs <- log(pmax(probs_use, eps))
+        log_val <- sum(log_probs * weights_use)
+        tibble(site = site_id, value = exp(log_val), log_value = log_val)
+      }
+    }) %>% mutate(draw = d, .before = 1)
+  })
+
+  res
+}
+
+# Summarise CSI draws per site with HDI and quantiles
+summarise_csi_over_draws <- function(draw_site_df, prob = hdi_prob, central = "median") {
+  if (!nrow(draw_site_df)) return(tibble())
+  central <- match.arg(central, c("median", "mean"))
+
+  draw_site_df %>%
+    group_by(site) %>%
+    group_modify(~ {
+      stats <- summarise_posterior(.x$value, prob = prob, central = central)
+      if ("log_value" %in% names(.x)) {
+        log_stats <- summarise_posterior(.x$log_value, prob = prob, central = central) %>%
+          rename_with(~ paste0("log_", .x))
+        bind_cols(stats, log_stats)
+      } else {
+        stats
+      }
+    }) %>%
+    ungroup()
+}
+
+# Load posterior draws for a scenario and validate into array
+load_draws_for_scenario <- function(scn_label) {
+  entry <- scenario_map %>% filter(label == scn_label, !is.na(file_path)) %>% slice_head(n = 1)
+  if (!nrow(entry)) {
+    message("No draw file mapped for scenario: ", scn_label)
+    return(NULL)
+  }
+  file_path <- entry$file_path
+  if (!file.exists(file_path)) {
+    message("Mapped draw file missing on disk: ", file_path)
+    return(NULL)
+  }
+  env <- new.env(parent = emptyenv())
+  tryCatch({
+    load(file_path, envir = env)
+    if (!exists("preds", envir = env)) {
+      message("Object 'preds' not found in draw file: ", file_path)
+      return(NULL)
+    }
+    preds_list <- get("preds", envir = env)
+    if (!is.list(preds_list) || !length(preds_list)) {
+      message("'preds' is not a non-empty list in ", file_path)
+      return(NULL)
+    }
+    first_mat <- preds_list[[1]]
+    if (!is.matrix(first_mat)) {
+      message("First element of 'preds' not a matrix in ", file_path)
+      return(NULL)
+    }
+    site_ids <- rownames(first_mat)
+    species_ids <- colnames(first_mat)
+    if (is.null(site_ids) || is.null(species_ids)) {
+      message("Matrix missing dimnames (site/species) in ", file_path)
+      return(NULL)
+    }
+    aligned <- map(preds_list, function(mat) {
+      if (!is.matrix(mat)) return(NULL)
+      if (is.null(rownames(mat)) || is.null(colnames(mat))) return(NULL)
+      if (!all(site_ids %in% rownames(mat))) return(NULL)
+      if (!all(species_ids %in% colnames(mat))) return(NULL)
+      mat[site_ids, species_ids, drop = FALSE]
+    })
+    if (any(map_lgl(aligned, is.null))) {
+      message("One or more draw matrices failed alignment for scenario: ", scn_label)
+      return(NULL)
+    }
+    n_draws <- length(aligned)
+    draws_array <- array(NA_real_, dim = c(n_draws, length(site_ids), length(species_ids)),
+                        dimnames = list(draw = seq_len(n_draws), site = site_ids, species = species_ids))
+    for (i in seq_len(n_draws)) draws_array[i, , ] <- aligned[[i]]
+    message("Loaded ", n_draws, " draws for scenario: ", scn_label)
+    draws_array
+  }, error = function(e) {
+    message("Failed to load draws for ", scn_label, ": ", conditionMessage(e))
+    NULL
+  })
+}
 
 
 # --- Helper Functions ---
@@ -38,9 +410,12 @@ calculate_csi <- function(community_species, site_suitability_probs, method = "b
   } else if (method == "wCSI") {
     if (is.null(weights)) weights <- setNames(rep(1, length(valid_species)), valid_species)
     valid_weights <- weights[valid_species]
+    if (all(is.na(valid_weights)) || sum(valid_weights, na.rm = TRUE) == 0) {
+      return(mean(probs, na.rm = TRUE))
+    }
     return(weighted.mean(probs, valid_weights, na.rm = TRUE))
   } else if (method == "gCSI") {
-    return(exp(mean(log(probs + 1e-9), na.rm = TRUE)))
+    return(exp(mean(log(pmax(probs, epsilon)), na.rm = TRUE)))
   }
 }
 
@@ -54,6 +429,8 @@ ui <- fluidPage(
       width = 3,
       h4("Global Settings"),
       selectInput("climate_scenario", "1. Select Climate Scenario:", choices = names(all_predictions_summary)),
+      checkboxInput("use_draws", label = "Use posterior draws (slower)", value = FALSE),
+      selectInput("comparison_scenario", "2. Select Comparison Scenario (optional):", choices = c("None", names(all_predictions_summary)), selected = "None"),
   selectInput("basemap", "Base Map:",
       choices = c("CartoDB.Positron", "OpenStreetMap", "Esri.WorldTopoMap", "Esri.WorldGrayCanvas", "Stamen.TonerLite"),
       selected = "CartoDB.Positron"),
@@ -66,15 +443,14 @@ ui <- fluidPage(
         radioButtons("community_method", "2. Define Community:",
                      choices = c("Select Potential Vegetation" = "type_eco", "Create Custom Community" = "custom")),
         conditionalPanel("input.community_method == 'type_eco'",
-                       selectInput("type_eco_choice", "Select Potential Vegetation:", choices = names(TYPE_ECO_list)),
-                       wellPanel(style = "background: #f8f9fa;", textOutput("type_eco_desc"))),
+                 selectizeInput("type_eco_choice", "Select Potential Vegetation:", choices = community_choices, options = list(placeholder = 'Type or pick a vegetation type...')),
+                 wellPanel(style = "background: #f8f9fa;", textOutput("type_eco_desc"))),
         conditionalPanel("input.community_method == 'custom'",
                        selectizeInput("custom_species", "Select Species:", choices = setNames(species_map$code, species_map$pretty_name), multiple = TRUE)),
         selectInput("csi_metric", "3. Select Suitability Metric:",
                     choices = c("Basic CSI" = "bCSI", "Weighted CSI" = "wCSI", "Geometric Mean CSI" = "gCSI")),
         uiOutput("species_weights_ui"),
-        actionButton("run_community_analysis", "Calculate Suitability", icon = icon("cogs"), class = "btn-primary"),
-        actionButton("clear_selection", "Clear Plot Selection")
+        actionButton("run_community_analysis", "Calculate Suitability", icon = icon("cogs"), class = "btn-primary") 
       ),
       
       conditionalPanel(
@@ -90,7 +466,10 @@ ui <- fluidPage(
       tabsetPanel(id = "main_tabs",
         tabPanel("Community-Centric",
                  h3(textOutput("community_output_title")),
-                 leafletOutput("csi_map", height = "600px"),
+                 fluidRow(
+                   column(6, h4("Selected Scenario"), leafletOutput("csi_map", height = "500px")),
+                   column(6, conditionalPanel("input.comparison_scenario != 'None'", h4("Comparison Scenario"), leafletOutput("csi_map_comparison", height = "500px")))
+                 ),
                  downloadButton("download_csv", "Download CSV"),
                  DT::dataTableOutput("csi_table")),
         tabPanel("Site-Centric",
@@ -114,13 +493,16 @@ ui <- fluidPage(
                    tags$li("Predict species probabilities under current and future climates."),
                    tags$li("Calculate Community Suitability Indices (CSI) for entire communities."),
                    tags$li("Visualize results on interactive maps."),
-                   tags$li("Compare scenarios and perspectives (community vs. site-focused).")
+                   tags$li("Compare scenarios and perspectives (community vs. site-focused)."),
+                   tags$li("Toggle posterior draws for full uncertainty (disabled by default for faster loading)."),
+                   tags$li("Progress bars display computation status when draws are enabled.")
                  ),
                  hr(),
                  h4("2. How to Use the App"),
                  p("Follow these steps to explore the data:"),
                  tags$ol(
                    tags$li(tags$strong("Select a Climate Scenario:"), "Choose from current conditions or future projections (e.g., different GCMs like 'SSP3 7.0 - 2041_2070'). This affects all predictions."),
+                   tags$li(tags$strong("(Optional) Enable Posterior Draws:"), "Check 'Use posterior draws (slower)' only if you need exact credible intervals; leave unchecked for rapid exploration."),
                    tags$li(tags$strong("Choose an Analysis Perspective:"), 
                       tags$ul(
                         tags$li(tags$strong("Community-Centric:"), "Focus on how well a whole community (e.g., a potential vegetation type) fits a site. Define the community, select a metric, and view suitability maps."),
@@ -137,8 +519,18 @@ ui <- fluidPage(
                    tags$li("Explore tabs: 'Main Analysis' for results, 'Climate Maps' for climate variables, and this 'How to Use' guide.")
                  ),
                  p("Tip: Use the sidebar to adjust settings and the main panel to view outputs. Hover over map points for details."),
+                 p("Credible intervals use posterior draws when the checkbox is enabled; otherwise, faster summary-based approximations are shown (less exact for non-linear metrics like gCSI)."),
                  hr(),
-                 h4("3. Understanding the Suitability Metrics (CSI)"),
+                 h4("3. Posterior Draws & Performance"),
+                 p("Posterior draws provide precise uncertainty but increase computation time. The app defaults to the faster summary mode."),
+                 tags$ul(
+                   tags$li("Enable the 'Use posterior draws (slower)' checkbox to compute CSI per draw."),
+                   tags$li("A progress bar tracks draw processing and summarisation."),
+                   tags$li("If a scenario lacks a draw file, the app falls back automatically and notifies you."),
+                   tags$li("Disable the checkbox again to regain speed for exploratory comparisons.")
+                 ),
+                 hr(),
+                 h4("4. Understanding the Suitability Metrics (CSI)"),
                  p("CSI measures how suitable a site is for a community of species. It's based on predicted probabilities from the model. Here’s a simple breakdown:"),
                  h5("• Basic CSI (bCSI)"),
                  p("The average probability of occurrence for all species in the community."),
@@ -154,7 +546,7 @@ ui <- fluidPage(
                  p("Use when: All species must be present; sensitive to 'weak links'."),
                  p("Interpretation: Values near 1 mean high suitability; near 0 means low. Use maps to see spatial patterns."),
                  hr(),
-                 h4("4. Tips and Troubleshooting"),
+                 h4("5. Tips and Troubleshooting"),
                  tags$ul(
                    tags$li("Start with 'Current' scenario to understand baselines."),
                    tags$li("For custom communities, select 2-5 species to avoid overload. Note that the model was trained with a limited number of species. The names of non trained species are available for future improvements."),
@@ -163,7 +555,7 @@ ui <- fluidPage(
                    tags$li("Contact developers for model details or data sources.\n João Paulo Czarnecki de Liz \n jpczd@ulaval.ca")
                  ),
                  hr(),
-                 h4("5. Methodological Details"),
+                 h4("6. Methodological Details"),
                  p("This app uses the Hierarchical Model of Species Communities (Hmsc) for joint species distribution modeling, as described in:"),
                  p(tags$em("Tikhonov, G., Opedal, Ø.H., Abrego, N., Lehikoinen, A., de Jonge, M.M.J., Oksanen, J., Ovaskainen, O., 2020. Joint species distribution modelling with the r-package Hmsc. Methods in Ecology and Evolution 11, 442–447. https://doi.org/10.1111/2041-210X.13345")),
                  p("The simulations and modeling are based on permanent inventory sampled plots filtered for no human disturbances from the 4th campaign of the Quebec forest inventory. The variables as environmental predictors used in the modelling process were  Mean Annual Precipitation , Mean Annual Temperature, Organic Matter , Slope, and Drainage."),
@@ -219,6 +611,20 @@ server <- function(input, output, session) {
     all_predictions_summary[[input$climate_scenario]]
   })
 
+  scenario_draws <- reactive({
+    if (!isTRUE(input$use_draws)) {
+      message("[TCAMS] Draws disabled by user; using summary predictions for scenario: ", input$climate_scenario)
+      return(NULL)
+    }
+    drv <- load_draws_for_scenario(input$climate_scenario)
+    if (is.null(drv)) {
+      message("[TCAMS] No draws found; falling back to summary for scenario: ", input$climate_scenario)
+    } else {
+      message("[TCAMS] Draws loaded for scenario: ", input$climate_scenario, " dims=", paste(dim(drv), collapse="x"))
+    }
+    drv
+  })
+
   current_climate_data <- reactive({
     XData_future_list[[input$climate_scenario]] %>%
       as_tibble(rownames = "plot_id") %>%
@@ -234,9 +640,11 @@ server <- function(input, output, session) {
     }
   })
 
-  output$type_eco_desc <- renderText(
-    type_eco_descriptions$Description[type_eco_descriptions$type_eco_prefix == str_sub(input$type_eco_choice, 1, 3)]
-  )
+  output$type_eco_desc <- renderText({
+    req(input$type_eco_choice)
+    desc <- find_type_eco_description(input$type_eco_choice)
+    ifelse(is.na(desc), "", desc)
+  })
 
   output$species_weights_ui <- renderUI({
     req(input$csi_metric == "wCSI")
@@ -247,46 +655,201 @@ server <- function(input, output, session) {
   csi_results <- eventReactive(input$run_community_analysis, {
     community_spp <- target_community_species()
     req(length(community_spp) > 0)
-    pred_df <- preds_summary()$mean
-
+    preds_obj <- preds_summary()
+    pred_df <- preds_obj$mean
+    plot_ids <- rownames(pred_df)
+    metric <- input$csi_metric
     user_weights <- NULL
-    if (input$csi_metric == "wCSI") {
+    if (metric == "wCSI") {
       user_weights <- setNames(vapply(community_spp, function(x) {
         val <- input[[paste0("weight_", x)]]
         if (is.null(val)) 1 else val
       }, numeric(1)), community_spp)
     }
 
-    mean_csi <- apply(pred_df, 1, function(p) calculate_csi(community_spp, p, input$csi_metric, user_weights))
-    lower_csi <- apply(preds_summary()$lower, 1, function(p) calculate_csi(community_spp, p, input$csi_metric, user_weights))
-    upper_csi <- apply(preds_summary()$upper, 1, function(p) calculate_csi(community_spp, p, input$csi_metric, user_weights))
+    draws_obj <- scenario_draws()
+    use_draws <- FALSE
+    summary_tbl <- NULL
 
-    tibble(plot_id = rownames(pred_df), mean = mean_csi, lower = lower_csi, upper = upper_csi) %>%
-      mutate(ci_width = upper - lower) %>%
+    summary_tbl <- withProgress(message = "Calculating community suitability", value = 0, {
+      if (!is.null(draws_obj)) {
+        n_draws <- dim(draws_obj)[1]
+        progress_fun <- function(d, n) incProgress(0.8 / n, detail = paste("Processing draw", d, "of", n))
+        csi_draws <- compute_csi_per_draw_site(draws_obj, community_spp, metric, user_weights, eps = epsilon, progress_fun = progress_fun)
+        if (nrow(csi_draws)) {
+          use_draws <<- TRUE
+          incProgress(0.1, detail = "Summarising draws")
+          site_summary <- summarise_csi_over_draws(csi_draws, prob = hdi_prob, central = "median") %>% rename(plot_id = site)
+          tibble(plot_id = plot_ids) %>% left_join(site_summary, by = "plot_id")
+        } else {
+          NULL
+        }
+      } else {
+        incProgress(0.3, detail = "Using summary predictions")
+        NULL
+      }
+    })
+
+    if (is.null(summary_tbl)) {
+      shiny::showNotification(
+        "Draws not found or disabled; using summary-based approximation. Credible intervals may be less accurate for non-linear metrics (e.g., gCSI).",
+        type = if (is.null(draws_obj) || !use_draws) "message" else "warning", duration = 7
+      )
+      mean_csi <- apply(pred_df, 1, function(p) calculate_csi(community_spp, p, metric, user_weights))
+      lower_csi <- apply(preds_obj$lower, 1, function(p) calculate_csi(community_spp, p, metric, user_weights))
+      upper_csi <- apply(preds_obj$upper, 1, function(p) calculate_csi(community_spp, p, metric, user_weights))
+      summary_tbl <- tibble(
+        plot_id = plot_ids,
+        center = mean_csi,
+        mean = mean_csi,
+        sd = NA_real_,
+        hdi_lower = lower_csi,
+        hdi_upper = upper_csi,
+        q025 = lower_csi,
+        q975 = upper_csi
+      )
+    }
+
+    if (!"sd" %in% names(summary_tbl)) summary_tbl$sd <- NA_real_
+    if (!"q025" %in% names(summary_tbl)) summary_tbl$q025 <- summary_tbl$hdi_lower
+    if (!"q975" %in% names(summary_tbl)) summary_tbl$q975 <- summary_tbl$hdi_upper
+    summary_tbl$draws_used <- use_draws
+    summary_tbl$metric <- metric
+    summary_tbl$center <- ifelse(is.na(summary_tbl$center) & !is.na(summary_tbl$mean), summary_tbl$mean, summary_tbl$center)
+    summary_tbl$mean <- ifelse(is.na(summary_tbl$mean) & !is.na(summary_tbl$center), summary_tbl$center, summary_tbl$mean)
+    summary_tbl$ci_width <- summary_tbl$hdi_upper - summary_tbl$hdi_lower
+    summary_tbl$lower <- summary_tbl$hdi_lower
+    summary_tbl$upper <- summary_tbl$hdi_upper
+
+    summary_tbl %>%
       left_join(plots_for_map, by = "plot_id") %>%
       left_join(current_climate_data() %>% select(plot_id, MAP, MAT, pH, Clay, OM, rtp, twi, slope, drainage_class), by = "plot_id")
   })
 
-  output$community_output_title <- renderText(paste("Community Suitability for:", input$climate_scenario))
+  csi_results_comparison <- eventReactive(input$run_community_analysis, {
+    req(input$comparison_scenario != "None")
+    community_spp <- target_community_species()
+    req(length(community_spp) > 0)
+
+    preds_obj <- all_predictions_summary[[input$comparison_scenario]]
+    pred_df <- preds_obj$mean
+    plot_ids <- rownames(pred_df)
+    metric <- input$csi_metric
+
+    user_weights <- NULL
+    if (metric == "wCSI") {
+      user_weights <- setNames(vapply(community_spp, function(x) {
+        val <- input[[paste0("weight_", x)]]
+        if (is.null(val)) 1 else val
+      }, numeric(1)), community_spp)
+    }
+
+    draws_obj <- if (isTRUE(input$use_draws)) load_draws_for_scenario(input$comparison_scenario) else NULL
+    use_draws <- FALSE
+    summary_tbl <- NULL
+
+    summary_tbl <- withProgress(message = "Calculating comparison suitability", value = 0, {
+      if (!is.null(draws_obj)) {
+        n_draws <- dim(draws_obj)[1]
+        progress_fun <- function(d, n) incProgress(0.8 / n, detail = paste("Draw", d, "of", n))
+        csi_draws <- compute_csi_per_draw_site(draws_obj, community_spp, metric, user_weights, eps = epsilon, progress_fun = progress_fun)
+        if (nrow(csi_draws)) {
+          use_draws <<- TRUE
+          incProgress(0.1, detail = "Summarising draws")
+          site_summary <- summarise_csi_over_draws(csi_draws, prob = hdi_prob, central = "median") %>% rename(plot_id = site)
+          tibble(plot_id = plot_ids) %>% left_join(site_summary, by = "plot_id")
+        } else NULL
+      } else {
+        incProgress(0.3, detail = "Using summary predictions")
+        NULL
+      }
+    })
+
+    if (is.null(summary_tbl)) {
+      mean_csi <- apply(pred_df, 1, function(p) calculate_csi(community_spp, p, metric, user_weights))
+      lower_csi <- apply(preds_obj$lower, 1, function(p) calculate_csi(community_spp, p, metric, user_weights))
+      upper_csi <- apply(preds_obj$upper, 1, function(p) calculate_csi(community_spp, p, metric, user_weights))
+      summary_tbl <- tibble(
+        plot_id = plot_ids,
+        center = mean_csi,
+        mean = mean_csi,
+        sd = NA_real_,
+        hdi_lower = lower_csi,
+        hdi_upper = upper_csi,
+        q025 = lower_csi,
+        q975 = upper_csi
+      )
+    }
+
+    if (!"sd" %in% names(summary_tbl)) summary_tbl$sd <- NA_real_
+    if (!"q025" %in% names(summary_tbl)) summary_tbl$q025 <- summary_tbl$hdi_lower
+    if (!"q975" %in% names(summary_tbl)) summary_tbl$q975 <- summary_tbl$hdi_upper
+    summary_tbl$draws_used <- use_draws
+    summary_tbl$metric <- metric
+    summary_tbl$center <- ifelse(is.na(summary_tbl$center) & !is.na(summary_tbl$mean), summary_tbl$mean, summary_tbl$center)
+    summary_tbl$mean <- ifelse(is.na(summary_tbl$mean) & !is.na(summary_tbl$center), summary_tbl$center, summary_tbl$mean)
+    summary_tbl$ci_width <- summary_tbl$hdi_upper - summary_tbl$hdi_lower
+    summary_tbl$lower <- summary_tbl$hdi_lower
+    summary_tbl$upper <- summary_tbl$hdi_upper
+
+    summary_tbl %>%
+      left_join(plots_for_map, by = "plot_id") %>%
+      left_join((XData_future_list[[input$comparison_scenario]] %>%
+                   as_tibble(rownames = "plot_id") %>%
+                   left_join(plots_for_map, by = "plot_id") %>%
+                   select(plot_id, MAP, MAT, pH, Clay, OM, rtp, twi, slope, drainage_class)), by = "plot_id")
+  })
+
+  output$community_output_title <- renderText({
+    if (input$comparison_scenario != "None") {
+      paste("Community Suitability: ", input$climate_scenario, " vs ", input$comparison_scenario)
+    } else {
+      paste("Community Suitability for:", input$climate_scenario)
+    }
+  })
 
   output$csi_map <- renderLeaflet({
     req(csi_results())
     df <- csi_results()
-    pal <- colorNumeric(palette = "viridis", domain = df$mean, na.color = "transparent")
+    pal <- colorNumeric(palette = "viridis", domain = df$center, na.color = "transparent")
     leaflet(df) %>%
       addProviderTiles(providers[[input$basemap]]) %>%
-      addCircleMarkers(lng = ~longitude, lat = ~latitude, color = ~pal(mean),
+      addCircleMarkers(lng = ~longitude, lat = ~latitude, color = ~pal(center),
                        radius = 5, stroke = FALSE, fillOpacity = 0.8,
                        layerId = ~plot_id,
-                       popup = ~paste("Plot:", plot_id, "<br>Mean CSI:", round(mean, 3))) %>%
-      addLegend("bottomright", pal = pal, values = ~mean, title = "Mean CSI")
+                       popup = ~paste(
+                         "Plot:", plot_id,
+                         "<br>CSI (center):", sprintf("%.3f", center),
+                         "<br>HDI ", sprintf("%.0f", hdi_prob * 100), "%:", sprintf("%.3f - %.3f", hdi_lower, hdi_upper),
+                         "<br>q2.5-q97.5:", sprintf("%.3f - %.3f", q025, q975)
+                       )) %>%
+      addLegend("bottomright", pal = pal, values = ~center, title = "Mean CSI")
+  })
+
+  output$csi_map_comparison <- renderLeaflet({
+    req(csi_results_comparison())
+    df <- csi_results_comparison()
+    pal <- colorNumeric(palette = "viridis", domain = df$center, na.color = "transparent")
+    leaflet(df) %>%
+      addProviderTiles(providers[[input$basemap]]) %>%
+      addCircleMarkers(lng = ~longitude, lat = ~latitude, color = ~pal(center),
+                       radius = 5, stroke = FALSE, fillOpacity = 0.8,
+                       layerId = ~plot_id,
+                       popup = ~paste(
+                         "Plot:", plot_id,
+                         "<br>CSI (center):", sprintf("%.3f", center),
+                         "<br>HDI ", sprintf("%.0f", hdi_prob * 100), "%:", sprintf("%.3f - %.3f", hdi_lower, hdi_upper),
+                         "<br>q2.5-q97.5:", sprintf("%.3f - %.3f", q025, q975)
+                       )) %>%
+      addLegend("bottomright", pal = pal, values = ~center, title = "Mean CSI")
   })
 
   output$csi_table <- DT::renderDataTable({
     req(csi_results())
     csi_results() %>%
-      select(plot_id, latitude, longitude, MAP, MAT, pH, Clay, OM, rtp, twi, slope, drainage_class, mean, lower, upper, ci_width) %>%
-      arrange(desc(mean)) %>%
+      select(plot_id, metric, draws_used, latitude, longitude, MAP, MAT, pH, Clay, OM, rtp, twi, slope, drainage_class,
+             center, mean, hdi_lower, hdi_upper, q025, q975, ci_width) %>%
+      arrange(desc(center)) %>%
       mutate(across(where(is.numeric), ~round(., 3))) %>%
       DT::datatable(options = list(pageLength = 5), rownames = FALSE)
   })
@@ -297,14 +860,17 @@ server <- function(input, output, session) {
       paste("csi_results_", input$climate_scenario, "_", Sys.Date(), ".csv", sep = "")
     },
     content = function(file) {
-      write.csv(csi_results(), file, row.names = FALSE)
+      export_df <- csi_results() %>%
+        select(plot_id, metric, draws_used, center, mean, hdi_lower, hdi_upper, q025, q975, ci_width,
+               latitude, longitude, MAP, MAT, pH, Clay, OM, rtp, twi, slope, drainage_class, everything())
+      write.csv(export_df, file, row.names = FALSE)
     }
   )
 
   # --- Site-Centric Logic ---
   selected_plot_preds <- reactive({
     req(input$plot_choice, input$climate_scenario, cancelOutput = TRUE)
-    preds <- all_predictions_summary[[input$climate_scenario]]$mean
+    preds <- preds_summary()$mean
     message("Selected plot_id: ", input$plot_choice)
     message("Available plot_ids in preds: ", paste(head(rownames(preds)), collapse = ", "))
     if (!(input$plot_choice %in% rownames(preds))) {
@@ -314,6 +880,30 @@ server <- function(input, output, session) {
     selected <- preds[input$plot_choice, , drop = FALSE]
     message("Selected predictions: ", paste(selected, collapse = ", "))
     selected
+  })
+
+  selected_plot_posterior <- reactive({
+    req(input$plot_choice, cancelOutput = TRUE)
+    draws <- scenario_draws()
+    if (is.null(draws)) return(NULL)
+    site_ids <- dimnames(draws)[[2]]
+    if (!(input$plot_choice %in% site_ids)) return(NULL)
+    posterior_mat <- draws[, input$plot_choice, ]
+    if (is.null(dim(posterior_mat))) {
+      species_names <- dimnames(draws)[[3]]
+      col_name <- if (length(species_names)) species_names[1] else "species"
+      posterior_mat <- matrix(posterior_mat, ncol = 1)
+      colnames(posterior_mat) <- col_name
+    } else if (is.null(colnames(posterior_mat))) {
+      species_names <- dimnames(draws)[[3]]
+      if (length(species_names) >= ncol(posterior_mat)) {
+        colnames(posterior_mat) <- species_names[seq_len(ncol(posterior_mat))]
+      }
+    }
+    as_tibble(posterior_mat) %>%
+      mutate(draw = row_number(), .before = 1) %>%
+      pivot_longer(-draw, names_to = "original_name_in_data", values_to = "prob") %>%
+      filter(!is.na(prob))
   })
 
   output$site_location_map <- renderLeaflet({
@@ -330,21 +920,57 @@ server <- function(input, output, session) {
   })
 
   output$predicted_composition_plot <- renderPlot({
-    preds <- selected_plot_preds()
-    req(nrow(preds) > 0)
+    posterior_df <- selected_plot_posterior()
+    if (!is.null(posterior_df) && nrow(posterior_df) > 0) {
+      summary_tbl <- posterior_df %>%
+        left_join(species_map, by = "original_name_in_data") %>%
+        mutate(pretty_name = coalesce(pretty_name, original_name_in_data)) %>%
+        group_by(original_name_in_data, pretty_name) %>%
+        summarise(
+          center = median(prob, na.rm = TRUE),
+          mean = mean(prob, na.rm = TRUE),
+          q025 = quantile(prob, 0.025, na.rm = TRUE, names = FALSE),
+          q975 = quantile(prob, 0.975, na.rm = TRUE, names = FALSE),
+          .groups = "drop"
+        ) %>%
+        arrange(desc(center)) %>%
+        slice_head(n = 20)
 
-    plot_data <- as.data.frame(preds) %>%
-      pivot_longer(everything(), names_to = "original_name_in_data", values_to = "prob") %>%
-      left_join(species_map, by = "original_name_in_data") %>%
-      filter(!is.na(prob)) %>%
-      arrange(desc(prob)) %>%
-      head(20)
+      req(nrow(summary_tbl) > 0)
+      plot_data <- posterior_df %>%
+        filter(original_name_in_data %in% summary_tbl$original_name_in_data) %>%
+        left_join(summary_tbl %>% select(original_name_in_data, center), by = "original_name_in_data") %>%
+        left_join(species_map, by = "original_name_in_data") %>%
+        mutate(pretty_name = coalesce(pretty_name, original_name_in_data)) %>%
+        mutate(pretty_name = reorder(pretty_name, center))
 
-    ggplot(plot_data, aes(x = reorder(pretty_name, prob), y = prob)) +
-      geom_col(fill = "steelblue") +
-      coord_flip() +
-      labs(x = "Species", y = "Probability of Occurrence", title = "Top 20 Most Probable Species") +
-      theme_minimal(base_size = 14)
+      summary_tbl <- summary_tbl %>%
+        mutate(pretty_name = factor(pretty_name, levels = levels(plot_data$pretty_name)))
+
+      ggplot(plot_data, aes(x = pretty_name, y = prob)) +
+        geom_violin(fill = "steelblue", color = NA, alpha = 0.6, scale = "width") +
+        geom_linerange(data = summary_tbl, aes(x = pretty_name, ymin = q025, ymax = q975), inherit.aes = FALSE, color = "navy", size = 1) +
+        geom_point(data = summary_tbl, aes(x = pretty_name, y = center), inherit.aes = FALSE, color = "navy", size = 2) +
+        coord_flip() +
+        labs(x = "Species", y = "Probability of Occurrence", title = "Posterior distribution for top 20 species") +
+        theme_minimal(base_size = 14)
+    } else {
+      preds <- selected_plot_preds()
+      req(!is.null(preds), nrow(preds) > 0)
+
+      plot_data <- as.data.frame(preds) %>%
+        pivot_longer(everything(), names_to = "original_name_in_data", values_to = "prob") %>%
+        left_join(species_map, by = "original_name_in_data") %>%
+        filter(!is.na(prob)) %>%
+        arrange(desc(prob)) %>%
+        slice_head(n = 20)
+
+      ggplot(plot_data, aes(x = reorder(pretty_name, prob), y = prob)) +
+        geom_col(fill = "steelblue") +
+        coord_flip() +
+        labs(x = "Species", y = "Probability of Occurrence", title = "Top 20 Most Probable Species") +
+        theme_minimal(base_size = 14)
+    }
   })
 
   # --- Climate Maps Tab ---
@@ -362,7 +988,7 @@ server <- function(input, output, session) {
   output$map_map <- renderLeaflet({
     df <- current_climate_data()
     req(nrow(df) > 0)
-    pal <- colorNumeric(palette = "magma", domain = global_map_range, na.color = "transparent")
+    pal <- colorNumeric(palette = "viridis", domain = global_map_range, na.color = "transparent")
     leaflet(df) %>% addProviderTiles(providers[[input$basemap]]) %>%
       addCircleMarkers(lng = ~longitude, lat = ~latitude, color = ~pal(MAP),
                        radius = 5, stroke = FALSE, fillOpacity = 0.8,
