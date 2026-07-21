@@ -12,6 +12,13 @@ library(tidyverse)
 library(leaflet)
 library(DT)
 library(sf)
+if (requireNamespace("shinycssloaders", quietly = TRUE)) {
+  library(shinycssloaders)
+  .with_spinner <- function(ui_el) shinycssloaders::withSpinner(ui_el, color = "#2c3e50", proxy.height = "300px")
+} else {
+  message("[TCAMS] Package 'shinycssloaders' not installed; loading indicators disabled. Run install.packages('shinycssloaders') to enable them.")
+  .with_spinner <- function(ui_el) ui_el
+}
 
 ## Simplified single-folder deployment: all data and draw files reside with app.R
 ## Set base path to current working directory. Place app.R and all *.RData / *_preds_subsampled.Rda together.
@@ -38,6 +45,32 @@ if (exists("species_map") && is.data.frame(species_map)) {
     species_map$scientific_name,
     species_map$pretty_name,
     species_map$code
+  )
+
+  # Common English/French names, for dropdowns only (kept out of plot axes/legends
+  # to keep those compact and italicised on the scientific name alone). Mirrors the
+  # static reference table in the "How to Use" tab.
+  common_names_lookup <- tibble::tribble(
+    ~code, ~common_name_en,          ~common_name_fr,
+    "ERR", "Red Maple",              "Érable rouge",
+    "ERS", "Sugar Maple",            "Érable à sucre",
+    "BOJ", "Yellow Birch",           "Bouleau jaune",
+    "BOP", "Paper Birch",            "Bouleau à papier (blanc)",
+    "EPB", "White Spruce",           "Épinette blanche",
+    "SAB", "Balsam Fir",             "Sapin baumier",
+    "EPN", "Black Spruce",           "Épinette noire",
+    "THO", "Eastern White-cedar",    "Thuya occidental",
+    "PRP", "Pin Cherry",             "Cerisier de Pennsylvanie",
+    "PET", "Trembling Aspen",        "Peuplier faux-tremble",
+    "PIB", "Eastern White Pine",     "Pin blanc",
+    "MEL", "Tamarack",               "Mélèze laricin",
+    "PIG", "Jack Pine",              "Pin gris"
+  )
+  species_map <- species_map %>% dplyr::left_join(common_names_lookup, by = "code")
+  species_map$dropdown_label <- dplyr::if_else(
+    !is.na(species_map$common_name_en),
+    paste0(species_map$display_name, " — ", species_map$common_name_en),
+    species_map$display_name
   )
 }
 
@@ -528,9 +561,14 @@ ui <- fluidPage(
                  selectizeInput("type_eco_choice", "Select Potential Vegetation:", choices = community_choices, options = list(placeholder = 'Type or pick a vegetation type...')),
                  wellPanel(style = "background: #f8f9fa;", textOutput("type_eco_desc"))),
         conditionalPanel("input.community_method == 'custom'",
-                       selectizeInput("custom_species", "Select Species:", choices = setNames(species_map$code, species_map$display_name), multiple = TRUE)),
+                       selectizeInput("custom_species", "Select Species:", choices = setNames(species_map$code, species_map$dropdown_label), multiple = TRUE)),
         selectInput("csi_metric", "3. Select Suitability Metric:",
                     choices = c("Basic CSI" = "bCSI", "Weighted CSI" = "wCSI", "Geometric Mean CSI" = "gCSI")),
+        tags$div(style = "font-size: 0.82em; color: #6c757d; margin-top: -6px; margin-bottom: 10px;",
+          tags$strong("bCSI"), ": simple average of each species' occurrence probability. ",
+          tags$strong("wCSI"), ": average weighted by the species importance you set below. ",
+          tags$strong("gCSI"), ": geometric mean — penalises communities where even one species has low suitability (a \"weakest-link\" index)."
+        ),
         uiOutput("species_weights_ui"),
         actionButton("run_community_analysis", "Calculate Suitability", icon = icon("cogs"), class = "btn-primary") 
       ),
@@ -545,6 +583,9 @@ ui <- fluidPage(
       conditionalPanel(
         condition = "input.main_tabs == 'Trajectories'",
         h4("Trajectories: Baseline to Future"),
+        tags$div(style = "font-size: 0.85em; color: #6c757d; margin-bottom: 8px;",
+                 icon("info-circle"),
+                 " The \"Select Climate Scenario\" selector above is ignored on this tab — it always plots the Current baseline plus all 12 future scenarios together."),
         radioButtons("traj_view", "2. View by:",
                      choices = c("Potential Vegetation Community" = "community",
                                  "Individual Species" = "species")),
@@ -555,12 +596,24 @@ ui <- fluidPage(
         conditionalPanel(
           "input.traj_view == 'species'",
           selectizeInput("traj_species", "Select Species:",
-                          choices = setNames(species_map$code, species_map$display_name),
+                          choices = setNames(species_map$code, species_map$dropdown_label),
                           multiple = TRUE,
                           selected = species_map$code)
         ),
         checkboxInput("traj_normalize", "Show as 100% stacked composition", value = FALSE),
-        helpText("Areas show the mean predicted probability of occurrence (spatial average across all plots) for the Current baseline and each future horizon × SSP scenario. When a community is selected, the lower panel also shows its gCSI trajectory with 95% credible intervals.")
+        checkboxInput("traj_compare", "Compare with a second selection", value = FALSE),
+        conditionalPanel(
+          "input.traj_compare == true && input.traj_view == 'community'",
+          selectInput("traj_community2", "Second community to compare:", choices = community_choices)
+        ),
+        conditionalPanel(
+          "input.traj_compare == true && input.traj_view == 'species'",
+          selectizeInput("traj_species2", "Second species set to compare:",
+                          choices = setNames(species_map$code, species_map$dropdown_label),
+                          multiple = TRUE)
+        ),
+        helpText("Areas show the mean predicted probability of occurrence (spatial average across all plots) for the Current baseline and each future horizon × SSP scenario. When a community is selected, the lower panel also shows its gCSI trajectory with 95% credible intervals."),
+        downloadButton("download_traj_csv", "Download trajectory data (CSV)")
       )
     ),
     
@@ -570,30 +623,40 @@ ui <- fluidPage(
         tabPanel("Community-Centric",
                  h3(textOutput("community_output_title")),
                  fluidRow(
-                   column(6, h4("Selected Scenario"), leafletOutput("csi_map", height = "500px")),
-                   column(6, conditionalPanel("input.comparison_scenario != 'None'", h4("Comparison Scenario"), leafletOutput("csi_map_comparison", height = "500px")))
+                   column(6, h4("Selected Scenario"), .with_spinner(leafletOutput("csi_map", height = "500px"))),
+                   column(6, conditionalPanel("input.comparison_scenario != 'None'", h4("Comparison Scenario"), .with_spinner(leafletOutput("csi_map_comparison", height = "500px"))))
                  ),
                  downloadButton("download_csv", "Download CSV"),
                  DT::dataTableOutput("csi_table")),
         tabPanel("Site-Centric",
                  h3(textOutput("site_output_title")),
-                 plotOutput("predicted_composition_plot")),
+                 .with_spinner(plotOutput("predicted_composition_plot"))),
         tabPanel("Climate Maps",
                  h4("Climate Variables for Selected Scenario"),
                  fluidRow(
-                   column(6, leafletOutput("map_mat", height = "400px")),
-                   column(6, leafletOutput("map_map", height = "400px"))
+                   column(6, .with_spinner(leafletOutput("map_mat", height = "400px"))),
+                   column(6, .with_spinner(leafletOutput("map_map", height = "400px")))
                  )
         ),
         tabPanel("Trajectories",
                  h3("Trajectories from Baseline to Future Scenarios"),
                  p("Stacked-area view of how predicted occurrence probability changes from the current climate baseline (1991-2020) through three future horizons (2011-2040, 2041-2070, 2071-2100), under four SSP scenarios. Toggle between absolute probability (area height reflects overall community suitability) and 100% stacked composition (area height is always full, showing only the ", tags$em("relative"), " share of each species)."),
-                 plotOutput("traj_area_plot", height = "550px"),
+                 .with_spinner(plotOutput("traj_area_plot", height = "550px")),
                  conditionalPanel(
                    "input.traj_view == 'community'",
                    hr(),
                    h4("Community Suitability Index (gCSI) trajectory"),
-                   plotOutput("traj_csi_plot", height = "350px")
+                   .with_spinner(plotOutput("traj_csi_plot", height = "350px"))
+                 ),
+                 conditionalPanel(
+                   "input.traj_compare == true",
+                   hr(),
+                   h4("Comparison"),
+                   .with_spinner(plotOutput("traj_area_plot2", height = "550px")),
+                   conditionalPanel(
+                     "input.traj_view == 'community'",
+                     .with_spinner(plotOutput("traj_csi_plot2", height = "350px"))
+                   )
                  )
         ),
         tabPanel("How to Use",
@@ -1114,37 +1177,28 @@ server <- function(input, output, session) {
   })
 
   # --- Trajectories Tab ---
-  # Original data-column species codes (e.g. "ERR_n") for the currently selected
-  # community or custom species set.
-  traj_species_codes <- reactive({
-    if (identical(input$traj_view, "community")) {
-      req(input$traj_community)
-      TYPE_ECO_list[[input$traj_community]]
+  # Resolve the original data-column species codes (e.g. "ERR_n") for either a
+  # predefined community or a custom species selection.
+  resolve_traj_species_codes <- function(view, community_code, species_codes) {
+    if (identical(view, "community")) {
+      if (is.null(community_code) || !nzchar(community_code)) return(character(0))
+      TYPE_ECO_list[[community_code]]
     } else {
-      req(input$traj_species)
-      species_map$original_name_in_data[match(input$traj_species, species_map$code)]
+      if (is.null(species_codes) || !length(species_codes)) return(character(0))
+      species_map$original_name_in_data[match(species_codes, species_map$code)]
     }
-  })
+  }
 
-  traj_area_data <- reactive({
-    req(nrow(species_traj_summary) > 0)
-    spp <- traj_species_codes()
-    df <- species_traj_summary %>%
-      filter(species %in% spp, !is.na(horizon), !is.na(ssp))
-    req(nrow(df) > 0)
+  build_traj_area_data <- function(spp) {
+    if (!nrow(species_traj_summary) || !length(spp)) return(tibble())
+    df <- species_traj_summary %>% filter(species %in% spp, !is.na(horizon), !is.na(ssp))
+    if (!nrow(df)) return(df)
     replicate_baseline_across_ssp(df)
-  })
+  }
 
-  output$traj_area_plot <- renderPlot({
-    df <- traj_area_data()
-    normalize <- isTRUE(input$traj_normalize)
+  render_traj_area_plot <- function(df, normalize, title_txt) {
+    validate(need(nrow(df) > 0, "No data available for this selection."))
     stack_pos <- if (normalize) "fill" else "stack"
-
-    title_txt <- if (identical(input$traj_view, "community")) {
-      paste0("Species composition — ", find_type_eco_description(input$traj_community), " (", input$traj_community, ")")
-    } else {
-      "Selected species: predicted occurrence probability"
-    }
     y_lab <- if (normalize) {
       "Relative contribution to total predicted probability"
     } else {
@@ -1154,6 +1208,7 @@ server <- function(input, output, session) {
     p <- ggplot(df, aes(x = horizon, y = mean, fill = display_name, group = display_name)) +
       geom_area(position = stack_pos, alpha = 0.9, colour = "white", linewidth = 0.15) +
       facet_wrap(~ ssp, nrow = 1) +
+      scale_fill_viridis_d(option = "turbo") +
       theme_minimal(base_size = 13) +
       theme(
         legend.text = element_text(face = "italic"),
@@ -1164,14 +1219,13 @@ server <- function(input, output, session) {
 
     if (normalize) p <- p + scale_y_continuous(labels = scales::percent)
     p
-  })
+  }
 
-  output$traj_csi_plot <- renderPlot({
-    req(identical(input$traj_view, "community"))
-    req(nrow(community_traj_summary) > 0, input$traj_community)
-    df <- community_traj_summary %>%
-      filter(community_prefix == input$traj_community, !is.na(horizon), !is.na(ssp))
-    req(nrow(df) > 0)
+  render_traj_csi_plot <- function(community_code) {
+    validate(need(!is.null(community_code) && nzchar(community_code), "Select a community to see its gCSI trajectory."))
+    validate(need(nrow(community_traj_summary) > 0, "Community CSI trajectory data not available."))
+    df <- community_traj_summary %>% filter(community_prefix == community_code, !is.na(horizon), !is.na(ssp))
+    validate(need(nrow(df) > 0, "No gCSI trajectory data for this community."))
     plot_df <- replicate_baseline_across_ssp(df)
 
     ggplot(plot_df, aes(x = horizon, y = gCenter, ymin = gQ025, ymax = gQ975, group = ssp, color = ssp, fill = ssp)) +
@@ -1179,11 +1233,68 @@ server <- function(input, output, session) {
       geom_line(linewidth = 1) +
       geom_point(size = 2) +
       facet_wrap(~ ssp, nrow = 1) +
+      scale_color_viridis_d(option = "turbo") +
+      scale_fill_viridis_d(option = "turbo") +
       theme_minimal(base_size = 13) +
       theme(legend.position = "none", axis.text.x = element_text(angle = 30, hjust = 1), strip.text = element_text(face = "bold")) +
       labs(x = NULL, y = "Geometric Community Suitability Index (gCSI)",
-           title = paste0("gCSI trajectory (mean, 95% credible interval) — ", find_type_eco_description(input$traj_community)))
+           title = paste0("gCSI trajectory (mean, 95% credible interval) — ", find_type_eco_description(community_code)))
+  }
+
+  traj_title <- function(view, community_code, prefix = "") {
+    if (identical(view, "community")) {
+      paste0(prefix, "Species composition — ", find_type_eco_description(community_code), " (", community_code, ")")
+    } else {
+      paste0(prefix, "Selected species: predicted occurrence probability")
+    }
+  }
+
+  # --- Primary selection ---
+  traj_species_codes <- reactive({
+    resolve_traj_species_codes(input$traj_view, input$traj_community, input$traj_species)
   })
+  traj_area_data <- reactive({
+    req(length(traj_species_codes()) > 0)
+    build_traj_area_data(traj_species_codes())
+  })
+  output$traj_area_plot <- renderPlot({
+    render_traj_area_plot(traj_area_data(), isTRUE(input$traj_normalize), traj_title(input$traj_view, input$traj_community))
+  })
+  output$traj_csi_plot <- renderPlot({
+    req(identical(input$traj_view, "community"))
+    render_traj_csi_plot(input$traj_community)
+  })
+
+  # --- Comparison (second) selection ---
+  traj_species_codes2 <- reactive({
+    req(isTRUE(input$traj_compare))
+    resolve_traj_species_codes(input$traj_view, input$traj_community2, input$traj_species2)
+  })
+  traj_area_data2 <- reactive({
+    req(length(traj_species_codes2()) > 0)
+    build_traj_area_data(traj_species_codes2())
+  })
+  output$traj_area_plot2 <- renderPlot({
+    render_traj_area_plot(traj_area_data2(), isTRUE(input$traj_normalize), traj_title(input$traj_view, input$traj_community2, "Comparison: "))
+  })
+  output$traj_csi_plot2 <- renderPlot({
+    req(isTRUE(input$traj_compare), identical(input$traj_view, "community"))
+    render_traj_csi_plot(input$traj_community2)
+  })
+
+  # --- Download trajectory data behind the current plot(s) ---
+  output$download_traj_csv <- downloadHandler(
+    filename = function() paste0("tcams_trajectories_", Sys.Date(), ".csv"),
+    content = function(file) {
+      primary <- traj_area_data() %>% mutate(selection = "primary")
+      out <- primary
+      if (isTRUE(input$traj_compare) && length(traj_species_codes2()) > 0) {
+        secondary <- build_traj_area_data(traj_species_codes2()) %>% mutate(selection = "comparison")
+        out <- dplyr::bind_rows(primary, secondary)
+      }
+      readr::write_csv(out, file)
+    }
+  )
 }
 
 # --- Run the App ---

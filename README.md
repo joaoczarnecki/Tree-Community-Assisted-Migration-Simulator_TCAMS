@@ -27,8 +27,9 @@ Single-folder deployment: `app.R` and every data file it needs
 `data/trajectories/*.csv`) must stay together in this folder.
 
 ```r
-# install once
-install.packages(c("shiny","shinythemes","tidyverse","leaflet","DT","sf"))
+# install once (shinycssloaders is optional — enables loading spinners;
+# the app runs fine without it, just without the spinner animation)
+install.packages(c("shiny","shinythemes","tidyverse","leaflet","DT","sf","shinycssloaders"))
 
 # from this folder
 shiny::runApp(".")
@@ -126,6 +127,36 @@ trajectory (posterior mean line + 95% credible ribbon) across the same
 horizons/SSPs, reusing `data/trajectories/gCSI_trajectory_summary_draws.csv`
 — the same draws-based pipeline documented in
 `PEP_QC_HMSC_Analysis/R/003_compute_csi_from_draws.R`.
+
+You can also check **"Compare with a second selection"** to pick a second
+community or species set and see both stacked-area charts (and, for
+communities, both gCSI panels) at once, and download the underlying data for
+whatever is currently plotted with **"Download trajectory data (CSV)"**.
+
+## Interface improvements added after the initial reorganization
+
+1. **Species dropdowns now show common names too.** `custom_species` and the
+   Trajectories tab's species pickers display
+   `Scientific name — English common name` (e.g. `Picea glauca — White
+   Spruce`), built from a small lookup table added to `species_map` at
+   startup (`common_names_lookup`, mirroring the French names already in the
+   "How to Use" table). Plot legends/axes keep using the scientific name
+   alone (italicised) to stay compact.
+2. **Colour-blind-friendly palette** (`scale_fill/color_viridis_d(option =
+   "turbo")`) applied to both Trajectories charts, consistent with the
+   viridis palette already used on the Climate Maps tab.
+3. **Loading spinners** (via the optional `shinycssloaders` package) on every
+   slow map/plot output — both maps, the site-centric composition plot, and
+   both Trajectories charts — so the app doesn't look frozen while
+   recomputing from posterior draws. Falls back to no spinner (but still
+   works) if the package isn't installed.
+4. **Explicit note** in the Trajectories sidebar that the top "Select Climate
+   Scenario" dropdown does not apply to that tab (it always shows the full
+   Current + 12-scenario trajectory).
+5. **CSI metric definitions** (bCSI/wCSI/gCSI, one line each) now shown
+   directly under the metric selector on the Community-Centric tab, instead
+   of only in "How to Use".
+6. **Side-by-side comparison** on the Trajectories tab (see above).
 
 ## Data provenance / assumptions made during this reorganization
 
