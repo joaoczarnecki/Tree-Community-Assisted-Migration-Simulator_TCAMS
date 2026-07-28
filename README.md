@@ -133,6 +133,53 @@ community or species set and see both stacked-area charts (and, for
 communities, both gCSI panels) at once, and download the underlying data for
 whatever is currently plotted with **"Download trajectory data (CSV)"**.
 
+## New: "Hexagon Map" tab
+
+Aggregates the same plot-level predictions used by the other maps into a
+20 km hexagonal grid (`sf::st_make_grid(..., square = FALSE)`, projected to
+NAD83 / Quebec Lambert (EPSG:32198) so 20 km hexagons are actually 20 km),
+showing the mean value per hexagon. Choose either a single species'
+occurrence probability or a community's suitability metric (bCSI/wCSI/gCSI);
+both use the `viridis` colour-blind-friendly palette, consistent with the
+Climate Maps tab. Hexagons containing no inventory plots are left blank.
+This is a fast, summary-based view (no posterior-draws option) meant for
+spotting broad spatial patterns rather than exact per-plot values.
+
+## Validated scope: only 13 species and 8 communities are "live"
+
+`species_map`/`TYPE_ECO_list` (loaded from the bundled `.RData` files) may in
+principle contain more species/community codes than have actually been
+validated for this app — e.g. from the broader official Quebec ecological
+classification, or species outside the 13 the JSDM was fitted on. To prevent
+silently broken or empty results for anything outside that scope, two
+whitelists are hardcoded near the top of `app.R`:
+
+```r
+VALID_SPECIES_CODES   <- c("ERR","ERS","BOJ","BOP","EPB","SAB","EPN","THO","PRP","PET","PIB","MEL","PIG")
+VALID_COMMUNITY_CODES <- c("FE3","ME1","MS1","MS6","MS2","RE2","RC3","RS2")
+```
+
+Anything outside these two lists — wherever it shows up, in any species or
+community dropdown across the app (Community-Centric, Trajectories, Hexagon
+Map) — is:
+
+1. **Visually ghosted**: prefixed with 🚧 and suffixed "(in development)" in
+   the dropdown label.
+2. **Functionally blocked**: a server-side observer reverts the selection the
+   instant it's made and shows a warning notification
+   ("... is still under development and hasn't been validated for this app
+   yet."), so no computation ever actually runs on an unvalidated
+   species/community.
+3. **Defensively filtered** a second time inside the reactive functions that
+   resolve a community's member species
+   (`target_community_species()`/`resolve_traj_species_codes()`), in case a
+   ghosted value ever reaches them by another path.
+
+Note this validated set of 8 communities is a subset of the 10 in the
+manuscript's Table 1 — `FE6` (sugar maple–red oak) and `RP1` (white/red pine)
+are intentionally left out for now (ghosted, same as any other
+not-yet-validated code) until they're ready.
+
 ## Interface improvements added after the initial reorganization
 
 1. **Species dropdowns now show common names too.** `custom_species` and the

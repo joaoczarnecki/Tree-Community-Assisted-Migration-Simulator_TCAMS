@@ -74,6 +74,34 @@ if (exists("species_map") && is.data.frame(species_map)) {
   )
 }
 
+# --- Validated scope for this release ---
+# Only these 13 species and 8 vegetation communities have been curated/validated
+# for this app so far. Anything else that might appear in species_map/TYPE_ECO_list
+# (e.g. from the broader official Quebec ecological classification) is shown in
+# dropdowns as visually "ghosted" and blocked from actually being used until it
+# goes through the same validation. This is enforced twice: (1) cosmetically in the
+# dropdown labels below, and (2) functionally via server-side observers further
+# down that revert any such selection and show a warning notification.
+VALID_SPECIES_CODES <- c("ERR", "ERS", "BOJ", "BOP", "EPB", "SAB", "EPN", "THO", "PRP", "PET", "PIB", "MEL", "PIG")
+VALID_COMMUNITY_CODES <- c("FE3", "ME1", "MS1", "MS6", "MS2", "RE2", "RC3", "RS2")
+GHOST_MARKER <- "\U0001F6A7 "   # construction sign
+ghost_label <- function(label) paste0(GHOST_MARKER, label, " (in development)")
+
+if (exists("species_map") && is.data.frame(species_map)) {
+  species_map$dropdown_label <- dplyr::if_else(
+    species_map$code %in% VALID_SPECIES_CODES,
+    species_map$dropdown_label,
+    ghost_label(species_map$dropdown_label)
+  )
+  # Valid species first, then alphabetical, so the working options are easy to find.
+  species_map <- species_map %>%
+    dplyr::arrange(!(code %in% VALID_SPECIES_CODES), code)
+}
+# Same whitelist, expressed in the "original_name_in_data" form (e.g. "ERR_n")
+# used inside TYPE_ECO_list / prediction matrix column names, for defensive
+# filtering wherever a community's member species get resolved.
+VALID_ORIGINAL_NAMES <- species_map$original_name_in_data[species_map$code %in% VALID_SPECIES_CODES]
+
 # --- Trajectory data: species raw probability & community CSI across scenarios/horizons ---
 # These two files are pre-computed long-format summaries (posterior mean + 95% quantiles)
 # spanning the Current baseline and all 12 future horizon x SSP combinations. See
@@ -215,9 +243,14 @@ community_choices <- {
           d <- "Community definition unavailable"
         }
       }
-      paste(k, "-", d)
+      label <- paste(k, "-", d)
+      if (!(k %in% VALID_COMMUNITY_CODES)) label <- ghost_label(label)
+      label
     }, character(1))
-    setNames(codes, labels)
+    # Validated communities first (alphabetical), then everything else still under
+    # development (also alphabetical), so the 8 working options are easy to find.
+    ord <- order(!(codes %in% VALID_COMMUNITY_CODES), codes)
+    setNames(codes[ord], labels[ord])
   } else {
     character(0)
   }
@@ -534,6 +567,23 @@ calculate_csi <- function(community_species, site_suitability_probs, method = "b
   }
 }
 
+# --- Hexagon Map helpers ---
+# NAD83 / Quebec Lambert (metres) — a metric CRS is needed so a 20 km hexagon
+# actually measures 20 km, matching the projection already used elsewhere in
+# this project's analysis pipeline (create_spatial_studyDesign_for_Hmsc.R).
+HEX_CRS <- 32198
+HEX_CELLSIZE_M <- 20000
+
+# Builds a POINT sf object (in HEX_CRS) of plot_id/value pairs, dropping any
+# plot without coordinates or without a finite value.
+build_hex_point_sf <- function(plot_ids, values) {
+  df <- tibble(plot_id = as.character(plot_ids), value = as.numeric(values)) %>%
+    dplyr::left_join(plots_for_map, by = "plot_id") %>%
+    dplyr::filter(!is.na(longitude), !is.na(latitude), is.finite(value))
+  if (!nrow(df)) return(NULL)
+  sf::st_as_sf(df, coords = c("longitude", "latitude"), crs = 4326) %>% sf::st_transform(HEX_CRS)
+}
+
 # --- UI ---
 ui <- fluidPage(
   theme = shinytheme("sandstone"),
@@ -558,7 +608,7 @@ ui <- fluidPage(
         radioButtons("community_method", "2. Define Community:",
                      choices = c("Select Potential Vegetation" = "type_eco", "Create Custom Community" = "custom")),
         conditionalPanel("input.community_method == 'type_eco'",
-                 selectizeInput("type_eco_choice", "Select Potential Vegetation:", choices = community_choices, options = list(placeholder = 'Type or pick a vegetation type...')),
+                 selectizeInput("type_eco_choice", "Select Potential Vegetation:", choices = community_choices, selected = VALID_COMMUNITY_CODES[1], options = list(placeholder = 'Type or pick a vegetation type...')),
                  wellPanel(style = "background: #f8f9fa;", textOutput("type_eco_desc"))),
         conditionalPanel("input.community_method == 'custom'",
                        selectizeInput("custom_species", "Select Species:", choices = setNames(species_map$code, species_map$dropdown_label), multiple = TRUE)),
@@ -591,20 +641,20 @@ ui <- fluidPage(
                                  "Individual Species" = "species")),
         conditionalPanel(
           "input.traj_view == 'community'",
-          selectInput("traj_community", "Select Community:", choices = community_choices)
+          selectInput("traj_community", "Select Community:", choices = community_choices, selected = VALID_COMMUNITY_CODES[1])
         ),
         conditionalPanel(
           "input.traj_view == 'species'",
           selectizeInput("traj_species", "Select Species:",
                           choices = setNames(species_map$code, species_map$dropdown_label),
                           multiple = TRUE,
-                          selected = species_map$code)
+                          selected = VALID_SPECIES_CODES)
         ),
         checkboxInput("traj_normalize", "Show as 100% stacked composition", value = FALSE),
         checkboxInput("traj_compare", "Compare with a second selection", value = FALSE),
         conditionalPanel(
           "input.traj_compare == true && input.traj_view == 'community'",
-          selectInput("traj_community2", "Second community to compare:", choices = community_choices)
+          selectInput("traj_community2", "Second community to compare:", choices = community_choices, selected = VALID_COMMUNITY_CODES[2])
         ),
         conditionalPanel(
           "input.traj_compare == true && input.traj_view == 'species'",
@@ -614,6 +664,27 @@ ui <- fluidPage(
         ),
         helpText("Areas show the mean predicted probability of occurrence (spatial average across all plots) for the Current baseline and each future horizon × SSP scenario. When a community is selected, the lower panel also shows its gCSI trajectory with 95% credible intervals."),
         downloadButton("download_traj_csv", "Download trajectory data (CSV)")
+      ),
+
+      conditionalPanel(
+        condition = "input.main_tabs == 'Hexagon Map'",
+        h4("Hexagon Map (20 km grid)"),
+        helpText("Aggregates the same plot-level predictions shown on the other maps into a 20 km hexagonal grid (mean value per hexagon), using the \"Select Climate Scenario\" chosen above. A colour-blind-friendly (viridis) palette is used throughout."),
+        radioButtons("hex_mode", "Show:",
+                     choices = c("Species occurrence probability" = "species",
+                                 "Community suitability (CSI)" = "community")),
+        conditionalPanel(
+          "input.hex_mode == 'species'",
+          selectizeInput("hex_species", "Select species:",
+                          choices = setNames(species_map$code, species_map$dropdown_label),
+                          selected = VALID_SPECIES_CODES[1])
+        ),
+        conditionalPanel(
+          "input.hex_mode == 'community'",
+          selectInput("hex_community", "Select community:", choices = community_choices, selected = VALID_COMMUNITY_CODES[1]),
+          selectInput("hex_metric", "Suitability metric:",
+                      choices = c("Basic CSI" = "bCSI", "Weighted CSI" = "wCSI", "Geometric Mean CSI" = "gCSI"))
+        )
       )
     ),
     
@@ -658,6 +729,11 @@ ui <- fluidPage(
                      .with_spinner(plotOutput("traj_csi_plot2", height = "350px"))
                    )
                  )
+        ),
+        tabPanel("Hexagon Map",
+                 h3("Spatial Aggregation into a 20 km Hexagonal Grid"),
+                 p("Same underlying plot-level predictions as the other maps, aggregated into 20 km hexagons (mean value per hexagon) for a less noisy, more readable view of broad spatial patterns. Hexagons with no inventory plots are left blank. Uses the colour-blind-friendly ", tags$em("viridis"), " palette."),
+                 .with_spinner(leafletOutput("hex_map", height = "650px"))
         ),
         tabPanel("How to Use",
                  h3("Welcome to the Tree Community-Assisted Migration Simulator (TCAMS)!"),
@@ -783,6 +859,71 @@ server <- function(input, output, session) {
   # Update plot_choice with server-side selectize for performance
   updateSelectizeInput(session, "plot_choice", choices = plots_for_map$plot_id, server = TRUE)
 
+  # --- Restrict species/community selections to the validated scope ---
+  # Ghosted options are still visible (and, for plain HTML selects, technically
+  # clickable), so this is the functional half of the restriction: any selection
+  # outside VALID_SPECIES_CODES/VALID_COMMUNITY_CODES is immediately reverted and
+  # the user is warned it's still in development. Combined with the ghosted
+  # dropdown labels built above, and the defensive filtering inside
+  # target_community_species()/resolve_traj_species_codes() below, this ensures
+  # no not-yet-validated species or community can actually drive a computation.
+  ghost_notice <- function(what) {
+    showNotification(
+      paste0("\"", what, "\" is still under development and hasn't been validated for this app yet. Please choose one of the available (non-greyed) options."),
+      type = "warning", duration = 6
+    )
+  }
+
+  enforce_valid_species <- function(input_id) {
+    observeEvent(input[[input_id]], {
+      current <- input[[input_id]]
+      invalid <- setdiff(current, VALID_SPECIES_CODES)
+      if (length(invalid)) {
+        bad_labels <- species_map$display_name[match(invalid, species_map$code)]
+        ghost_notice(paste(bad_labels[!is.na(bad_labels)], collapse = ", "))
+        updateSelectizeInput(session, input_id, selected = intersect(current, VALID_SPECIES_CODES))
+      }
+    }, ignoreNULL = FALSE)
+  }
+  enforce_valid_species("custom_species")
+  enforce_valid_species("traj_species")
+  enforce_valid_species("traj_species2")
+
+  enforce_valid_species_single <- function(input_id, default_code = VALID_SPECIES_CODES[1]) {
+    last_valid <- reactiveVal(default_code)
+    observeEvent(input[[input_id]], {
+      current <- input[[input_id]]
+      if (is.null(current) || !nzchar(current)) return(invisible(NULL))
+      if (current %in% VALID_SPECIES_CODES) {
+        last_valid(current)
+      } else {
+        bad_label <- species_map$display_name[match(current, species_map$code)]
+        ghost_notice(if (length(bad_label) && !is.na(bad_label)) bad_label else current)
+        updateSelectizeInput(session, input_id, selected = last_valid())
+      }
+    }, ignoreNULL = FALSE, ignoreInit = TRUE)
+  }
+  enforce_valid_species_single("hex_species")
+
+  enforce_valid_community <- function(input_id, is_selectize, default_code = VALID_COMMUNITY_CODES[1]) {
+    last_valid <- reactiveVal(default_code)
+    observeEvent(input[[input_id]], {
+      current <- input[[input_id]]
+      if (is.null(current) || !nzchar(current)) return(invisible(NULL))
+      if (current %in% VALID_COMMUNITY_CODES) {
+        last_valid(current)
+      } else {
+        ghost_notice(find_type_eco_description(current))
+        updater <- if (is_selectize) updateSelectizeInput else updateSelectInput
+        updater(session, input_id, selected = last_valid())
+      }
+    }, ignoreNULL = FALSE, ignoreInit = TRUE)
+  }
+  enforce_valid_community("type_eco_choice", is_selectize = TRUE, default_code = VALID_COMMUNITY_CODES[1])
+  enforce_valid_community("traj_community", is_selectize = FALSE, default_code = VALID_COMMUNITY_CODES[1])
+  enforce_valid_community("traj_community2", is_selectize = FALSE, default_code = VALID_COMMUNITY_CODES[2])
+  enforce_valid_community("hex_community", is_selectize = FALSE, default_code = VALID_COMMUNITY_CODES[1])
+
   # --- Reactive Data ---
   preds_summary <- reactive({
     all_predictions_summary[[input$climate_scenario]]
@@ -810,11 +951,12 @@ server <- function(input, output, session) {
 
   # --- Community-Centric Logic ---
   target_community_species <- reactive({
-    if (input$community_method == "type_eco") {
-      TYPE_ECO_list[[input$type_eco_choice]]
+    spp <- if (input$community_method == "type_eco") {
+      if (isTRUE(input$type_eco_choice %in% VALID_COMMUNITY_CODES)) TYPE_ECO_list[[input$type_eco_choice]] else character(0)
     } else {
       species_map$original_name_in_data[match(input$custom_species, species_map$code)]
     }
+    intersect(spp, VALID_ORIGINAL_NAMES)
   })
 
   output$type_eco_desc <- renderText({
@@ -1176,17 +1318,85 @@ server <- function(input, output, session) {
       addLegend("bottomright", pal = pal, values = ~MAP, title = "MAP (mm)")
   })
 
+  # --- Hexagon Map Tab ---
+  # The hexagon grid only depends on plot locations, which are fixed across
+  # scenarios/species, so it's built once per session and reused.
+  hex_grid_sf <- reactive({
+    pts <- plots_for_map %>% dplyr::filter(!is.na(longitude), !is.na(latitude))
+    req(nrow(pts) > 0)
+    pts_sf <- sf::st_as_sf(pts, coords = c("longitude", "latitude"), crs = 4326) %>% sf::st_transform(HEX_CRS)
+    grid <- sf::st_make_grid(pts_sf, cellsize = HEX_CELLSIZE_M, square = FALSE)
+    sf::st_sf(hex_id = seq_along(grid), geometry = grid)
+  })
+
+  # Plot-level values (+ a legend title) for whichever metric is currently
+  # selected, reusing the same summary predictions and CSI logic as the other
+  # tabs (species probability from all_predictions_summary; community CSI via
+  # the same calculate_csi() used by the Community-Centric tab).
+  hex_values <- reactive({
+    preds_obj <- preds_summary()
+    req(!is.null(preds_obj), !is.null(preds_obj$mean))
+    pred_df <- preds_obj$mean
+    plot_ids <- rownames(pred_df)
+
+    if (identical(input$hex_mode, "community")) {
+      req(input$hex_community %in% VALID_COMMUNITY_CODES, input$hex_metric)
+      community_spp <- intersect(TYPE_ECO_list[[input$hex_community]], VALID_ORIGINAL_NAMES)
+      req(length(community_spp) > 0)
+      values <- apply(pred_df, 1, function(p) calculate_csi(community_spp, p, input$hex_metric, NULL))
+      legend_title <- paste0(input$hex_metric, " — ", find_type_eco_description(input$hex_community))
+    } else {
+      req(input$hex_species %in% VALID_SPECIES_CODES)
+      orig_col <- species_map$original_name_in_data[match(input$hex_species, species_map$code)]
+      req(length(orig_col) == 1, orig_col %in% colnames(pred_df))
+      values <- pred_df[, orig_col]
+      legend_title <- paste0(species_map$display_name[match(input$hex_species, species_map$code)], "\noccurrence probability")
+    }
+    list(plot_ids = plot_ids, values = as.numeric(values), legend_title = legend_title)
+  })
+
+  hex_aggregated <- reactive({
+    hv <- hex_values()
+    pts_sf <- build_hex_point_sf(hv$plot_ids, hv$values)
+    req(!is.null(pts_sf))
+    grid <- hex_grid_sf()
+    joined <- sf::st_join(pts_sf, grid)
+    agg <- joined %>%
+      sf::st_drop_geometry() %>%
+      dplyr::filter(!is.na(hex_id)) %>%
+      dplyr::group_by(hex_id) %>%
+      dplyr::summarise(mean_value = mean(value, na.rm = TRUE), n_plots = dplyr::n(), .groups = "drop")
+    req(nrow(agg) > 0)
+    grid %>% dplyr::inner_join(agg, by = "hex_id") %>% sf::st_transform(4326)
+  })
+
+  output$hex_map <- renderLeaflet({
+    hex_sf <- hex_aggregated()
+    legend_title <- hex_values()$legend_title
+    pal <- colorNumeric(palette = "viridis", domain = hex_sf$mean_value, na.color = "transparent")
+    leaflet(hex_sf) %>%
+      addProviderTiles(providers[[input$basemap]]) %>%
+      addPolygons(fillColor = ~pal(mean_value), color = "white", weight = 0.6, fillOpacity = 0.8,
+                  popup = ~paste0("Mean value: ", sprintf("%.3f", mean_value), "<br>Plots in hexagon: ", n_plots),
+                  highlightOptions = highlightOptions(weight = 2, color = "#2c3e50", bringToFront = TRUE)) %>%
+      addLegend("bottomright", pal = pal, values = ~mean_value, title = legend_title, opacity = 0.9)
+  })
+
   # --- Trajectories Tab ---
   # Resolve the original data-column species codes (e.g. "ERR_n") for either a
   # predefined community or a custom species selection.
   resolve_traj_species_codes <- function(view, community_code, species_codes) {
-    if (identical(view, "community")) {
-      if (is.null(community_code) || !nzchar(community_code)) return(character(0))
-      TYPE_ECO_list[[community_code]]
+    spp <- if (identical(view, "community")) {
+      if (is.null(community_code) || !nzchar(community_code) || !(community_code %in% VALID_COMMUNITY_CODES)) {
+        character(0)
+      } else {
+        TYPE_ECO_list[[community_code]]
+      }
     } else {
       if (is.null(species_codes) || !length(species_codes)) return(character(0))
       species_map$original_name_in_data[match(species_codes, species_map$code)]
     }
+    intersect(spp, VALID_ORIGINAL_NAMES)
   }
 
   build_traj_area_data <- function(spp) {
