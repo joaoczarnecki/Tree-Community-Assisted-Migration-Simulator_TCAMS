@@ -151,6 +151,11 @@ side by side for that scenario, using the same species/community/metric
 selection — handy for visually comparing, e.g., the Current baseline against
 a future SSP/horizon combination.
 
+The leaflet legend on each map only shows the metric name (e.g. "Probability"
+or "gCSI") to avoid a long title covering part of the map; the full
+description (species/community + scenario) is shown as page text right above
+each map instead.
+
 ## Validated scope: only 13 species and 8 communities are "live"
 
 `species_map`/`TYPE_ECO_list` (loaded from the bundled `.RData` files) may in

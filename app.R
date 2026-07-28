@@ -734,8 +734,8 @@ ui <- fluidPage(
                  h3("Spatial Aggregation into a 20 km Hexagonal Grid"),
                  p("Same underlying plot-level predictions as the other maps, aggregated into 20 km hexagons (mean value per hexagon) for a less noisy, more readable view of broad spatial patterns. Hexagons with no inventory plots are left blank. Uses the colour-blind-friendly ", tags$em("viridis"), " palette. Set \"Select Comparison Scenario\" in Global Settings (sidebar) to see a second scenario side by side."),
                  fluidRow(
-                   column(6, h4("Selected Scenario"), .with_spinner(leafletOutput("hex_map", height = "600px"))),
-                   column(6, conditionalPanel("input.comparison_scenario != 'None'", h4("Comparison Scenario"), .with_spinner(leafletOutput("hex_map_comparison", height = "600px"))))
+                   column(6, h4("Selected Scenario"), uiOutput("hex_map_heading"), .with_spinner(leafletOutput("hex_map", height = "600px"))),
+                   column(6, conditionalPanel("input.comparison_scenario != 'None'", h4("Comparison Scenario"), uiOutput("hex_map_heading_comparison"), .with_spinner(leafletOutput("hex_map_comparison", height = "600px"))))
                  )
         ),
         tabPanel("How to Use",
@@ -1338,6 +1338,10 @@ server <- function(input, output, session) {
   # all_predictions_summary; community CSI via the same calculate_csi() used
   # by the Community-Centric tab). Parametrised by scenario so the same logic
   # drives both the primary and the side-by-side comparison map.
+  # Note the split between `legend_title` (kept short — just the metric name —
+  # so the on-map leaflet legend stays small) and `heading` (the full
+  # species/community + scenario description, shown as page text above the
+  # map instead, where there's room to wrap normally).
   compute_hex_values_for_scenario <- function(scenario_label) {
     preds_obj <- all_predictions_summary[[scenario_label]]
     req(!is.null(preds_obj), !is.null(preds_obj$mean))
@@ -1349,15 +1353,18 @@ server <- function(input, output, session) {
       community_spp <- intersect(TYPE_ECO_list[[input$hex_community]], VALID_ORIGINAL_NAMES)
       req(length(community_spp) > 0)
       values <- apply(pred_df, 1, function(p) calculate_csi(community_spp, p, input$hex_metric, NULL))
-      legend_title <- paste0(input$hex_metric, " — ", find_type_eco_description(input$hex_community))
+      legend_title <- input$hex_metric
+      subject <- find_type_eco_description(input$hex_community)
     } else {
       req(input$hex_species %in% VALID_SPECIES_CODES)
       orig_col <- species_map$original_name_in_data[match(input$hex_species, species_map$code)]
       req(length(orig_col) == 1, orig_col %in% colnames(pred_df))
       values <- pred_df[, orig_col]
-      legend_title <- paste0(species_map$display_name[match(input$hex_species, species_map$code)], "\noccurrence probability")
+      legend_title <- "Probability"
+      subject <- paste0(species_map$display_name[match(input$hex_species, species_map$code)], " — occurrence probability")
     }
-    list(plot_ids = plot_ids, values = as.numeric(values), legend_title = paste0(legend_title, " (", scenario_label, ")"))
+    heading <- tags$span(tags$strong(subject), tags$br(), tags$span(style = "color:#6c757d;", scenario_label))
+    list(plot_ids = plot_ids, values = as.numeric(values), legend_title = legend_title, heading = heading)
   }
 
   aggregate_hex_values <- function(hv) {
@@ -1390,6 +1397,7 @@ server <- function(input, output, session) {
     hex_sf <- hex_aggregated()
     render_hex_leaflet(hex_sf, hex_values()$legend_title)
   })
+  output$hex_map_heading <- renderUI(hex_values()$heading)
 
   hex_values_comparison <- reactive({
     req(input$comparison_scenario, input$comparison_scenario != "None")
@@ -1400,6 +1408,7 @@ server <- function(input, output, session) {
     hex_sf <- hex_aggregated_comparison()
     render_hex_leaflet(hex_sf, hex_values_comparison()$legend_title)
   })
+  output$hex_map_heading_comparison <- renderUI(hex_values_comparison()$heading)
 
   # --- Trajectories Tab ---
   # Resolve the original data-column species codes (e.g. "ERR_n") for either a
