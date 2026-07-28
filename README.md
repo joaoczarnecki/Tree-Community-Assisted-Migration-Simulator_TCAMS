@@ -145,6 +145,12 @@ Climate Maps tab. Hexagons containing no inventory plots are left blank.
 This is a fast, summary-based view (no posterior-draws option) meant for
 spotting broad spatial patterns rather than exact per-plot values.
 
+Like the Community-Centric tab, setting **"Select Comparison Scenario"** in
+the Global Settings sidebar (instead of "None") shows a second hexagon map
+side by side for that scenario, using the same species/community/metric
+selection — handy for visually comparing, e.g., the Current baseline against
+a future SSP/horizon combination.
+
 ## Validated scope: only 13 species and 8 communities are "live"
 
 `species_map`/`TYPE_ECO_list` (loaded from the bundled `.RData` files) may in

@@ -732,8 +732,11 @@ ui <- fluidPage(
         ),
         tabPanel("Hexagon Map",
                  h3("Spatial Aggregation into a 20 km Hexagonal Grid"),
-                 p("Same underlying plot-level predictions as the other maps, aggregated into 20 km hexagons (mean value per hexagon) for a less noisy, more readable view of broad spatial patterns. Hexagons with no inventory plots are left blank. Uses the colour-blind-friendly ", tags$em("viridis"), " palette."),
-                 .with_spinner(leafletOutput("hex_map", height = "650px"))
+                 p("Same underlying plot-level predictions as the other maps, aggregated into 20 km hexagons (mean value per hexagon) for a less noisy, more readable view of broad spatial patterns. Hexagons with no inventory plots are left blank. Uses the colour-blind-friendly ", tags$em("viridis"), " palette. Set \"Select Comparison Scenario\" in Global Settings (sidebar) to see a second scenario side by side."),
+                 fluidRow(
+                   column(6, h4("Selected Scenario"), .with_spinner(leafletOutput("hex_map", height = "600px"))),
+                   column(6, conditionalPanel("input.comparison_scenario != 'None'", h4("Comparison Scenario"), .with_spinner(leafletOutput("hex_map_comparison", height = "600px"))))
+                 )
         ),
         tabPanel("How to Use",
                  h3("Welcome to the Tree Community-Assisted Migration Simulator (TCAMS)!"),
@@ -1330,11 +1333,13 @@ server <- function(input, output, session) {
   })
 
   # Plot-level values (+ a legend title) for whichever metric is currently
-  # selected, reusing the same summary predictions and CSI logic as the other
-  # tabs (species probability from all_predictions_summary; community CSI via
-  # the same calculate_csi() used by the Community-Centric tab).
-  hex_values <- reactive({
-    preds_obj <- preds_summary()
+  # selected, for a given scenario label. Reuses the same summary predictions
+  # and CSI logic as the other tabs (species probability from
+  # all_predictions_summary; community CSI via the same calculate_csi() used
+  # by the Community-Centric tab). Parametrised by scenario so the same logic
+  # drives both the primary and the side-by-side comparison map.
+  compute_hex_values_for_scenario <- function(scenario_label) {
+    preds_obj <- all_predictions_summary[[scenario_label]]
     req(!is.null(preds_obj), !is.null(preds_obj$mean))
     pred_df <- preds_obj$mean
     plot_ids <- rownames(pred_df)
@@ -1352,11 +1357,10 @@ server <- function(input, output, session) {
       values <- pred_df[, orig_col]
       legend_title <- paste0(species_map$display_name[match(input$hex_species, species_map$code)], "\noccurrence probability")
     }
-    list(plot_ids = plot_ids, values = as.numeric(values), legend_title = legend_title)
-  })
+    list(plot_ids = plot_ids, values = as.numeric(values), legend_title = paste0(legend_title, " (", scenario_label, ")"))
+  }
 
-  hex_aggregated <- reactive({
-    hv <- hex_values()
+  aggregate_hex_values <- function(hv) {
     pts_sf <- build_hex_point_sf(hv$plot_ids, hv$values)
     req(!is.null(pts_sf))
     grid <- hex_grid_sf()
@@ -1368,11 +1372,9 @@ server <- function(input, output, session) {
       dplyr::summarise(mean_value = mean(value, na.rm = TRUE), n_plots = dplyr::n(), .groups = "drop")
     req(nrow(agg) > 0)
     grid %>% dplyr::inner_join(agg, by = "hex_id") %>% sf::st_transform(4326)
-  })
+  }
 
-  output$hex_map <- renderLeaflet({
-    hex_sf <- hex_aggregated()
-    legend_title <- hex_values()$legend_title
+  render_hex_leaflet <- function(hex_sf, legend_title) {
     pal <- colorNumeric(palette = "viridis", domain = hex_sf$mean_value, na.color = "transparent")
     leaflet(hex_sf) %>%
       addProviderTiles(providers[[input$basemap]]) %>%
@@ -1380,6 +1382,23 @@ server <- function(input, output, session) {
                   popup = ~paste0("Mean value: ", sprintf("%.3f", mean_value), "<br>Plots in hexagon: ", n_plots),
                   highlightOptions = highlightOptions(weight = 2, color = "#2c3e50", bringToFront = TRUE)) %>%
       addLegend("bottomright", pal = pal, values = ~mean_value, title = legend_title, opacity = 0.9)
+  }
+
+  hex_values <- reactive(compute_hex_values_for_scenario(input$climate_scenario))
+  hex_aggregated <- reactive(aggregate_hex_values(hex_values()))
+  output$hex_map <- renderLeaflet({
+    hex_sf <- hex_aggregated()
+    render_hex_leaflet(hex_sf, hex_values()$legend_title)
+  })
+
+  hex_values_comparison <- reactive({
+    req(input$comparison_scenario, input$comparison_scenario != "None")
+    compute_hex_values_for_scenario(input$comparison_scenario)
+  })
+  hex_aggregated_comparison <- reactive(aggregate_hex_values(hex_values_comparison()))
+  output$hex_map_comparison <- renderLeaflet({
+    hex_sf <- hex_aggregated_comparison()
+    render_hex_leaflet(hex_sf, hex_values_comparison()$legend_title)
   })
 
   # --- Trajectories Tab ---
