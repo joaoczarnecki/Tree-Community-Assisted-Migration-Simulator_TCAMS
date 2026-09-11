@@ -41,10 +41,7 @@ shiny::runApp(".")
 rsconnect::deployApp(appDir = ".", appName = "TCAMS_TreeCommunity-AssistedMigration_Simulator")
 ```
 
-The app was previously published under this exact name (see
-`SETUP_GIT.md` for the GitHub remote). Re-deploying from this folder will
-overwrite that version — confirm before running if you want to keep the
-previously published one as a reference.
+The app was previously published under this exact name.
 
 ## Contents
 
@@ -243,6 +240,4 @@ not-yet-validated code) until they're ready.
 
 See `SETUP_GIT.md` for exact commands to turn this folder into a git
 repository and push it to
-<https://github.com/joaoczarnecki/Tree-Community-Assisted-Migration-Simulator_TCAMS.git>
-(git is not installed on the machine this reorganization was performed on —
-those steps still need to be run manually).
+<https://github.com/joaoczarnecki/Tree-Community-Assisted-Migration-Simulator_TCAMS.git>.
