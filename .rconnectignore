@@ -1,0 +1,9 @@
+# Files bundled only for provenance/documentation. They are never read by
+# app.R at runtime, and contain absolute paths (from the original analysis
+# workspace) that rsconnect correctly flags as suspicious during deploy.
+001_JSDM_PEP_QC_Modeling_20250814.R
+002_JSDM_PEP_TCAMS_predictions.r
+
+# Documentation, not needed on the running server.
+README.md
+SETUP_GIT.md

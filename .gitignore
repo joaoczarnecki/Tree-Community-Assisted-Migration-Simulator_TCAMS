@@ -1,20 +1,15 @@
-.Rproj.user
+# R / RStudio
 .Rhistory
 .RData
-.Ruserdata
-.httr-oauth
+.Rproj.user/
+*.Rproj.user
+
+# OS
 .DS_Store
-.quarto
-.Rapp.history
-.Rbuildignore
-.Renviron
-.env
-.vscode
-.idea
-*_cache/
-*/_cache/
-reports/cache/
-targets/
-drake/
-_quarto/
+Thumbs.db
+
+# Editor
+.vscode/
+
+# rsconnect deployment metadata (contains account-specific tokens/paths)
 rsconnect/
